@@ -1,5 +1,6 @@
 
 const WebSocket = require('ws');
+const crypto = require('crypto');
 
 // Port used by Server Node B.
 const PORT = 8081;
@@ -9,6 +10,29 @@ const server = new WebSocket.Server({ port: PORT });
 
 // Store browser clients connected directly to Node B.
 const clients = new Set();
+
+// Track message IDs to prevent duplicate processing.
+const seenMessageIds = new Set();
+
+// Maximum number of message IDs retained in memory.
+const MAX_SEEN_MESSAGE_IDS = 5000;
+
+// Remember a message ID and report whether it is new.
+function rememberMessageId(messageId) {
+  if (seenMessageIds.has(messageId)) {
+    return false;
+  }
+
+  seenMessageIds.add(messageId);
+
+  // Remove the oldest ID when the cache exceeds its limit.
+  if (seenMessageIds.size > MAX_SEEN_MESSAGE_IDS) {
+    const oldestId = seenMessageIds.values().next().value;
+    seenMessageIds.delete(oldestId);
+  }
+
+  return true;
+}
 
 // Store the connection to Server Node A separately.
 let peerSocket = null;
@@ -123,19 +147,28 @@ server.on('connection', (socket, request) => {
     // Send messages that were queued while Node A was unavailable.
     flushPendingMessages();
 
-    // Receive messages relayed by Server Node A.
     socket.on('message', (data) => {
-      try {
-        // Convert the received data into a JavaScript object.
-        const packet = JSON.parse(data.toString());
+  try {
+    const packet = JSON.parse(data.toString());
 
-        // Forward the message to Node B's local browser clients.
-        if (packet.type === 'chat' && typeof packet.text === 'string') {
-          broadcastToClients(packet.text);
-        }
-      } catch (error) {
-        console.error('Invalid message received from Node A');
+    // Accept only valid chat packets with a message ID.
+    if (
+      packet.type === 'chat' &&
+      typeof packet.id === 'string' &&
+      typeof packet.text === 'string'
+    ) {
+      // Ignore messages already processed by Node B.
+      if (!rememberMessageId(packet.id)) {
+        console.log('Duplicate message ignored:', packet.id);
+        return;
       }
+
+      // Display the message to Node B's local browser clients.
+      broadcastToClients(packet.text);
+     }
+     } catch (error) {
+    console.error('Invalid message received from Node A:', error.message);
+     }
     });
 
     // Clear the peer reference if this connection closes.
@@ -161,26 +194,30 @@ server.on('connection', (socket, request) => {
 
   console.log(`Client connected to Node B. Total: ${clients.size}`);
 
-  // Receive messages sent by this browser client.
   socket.on('message', (data) => {
-    // Convert the received message into a string.
-    const message = data.toString();
+  const message = data.toString();
 
-    console.log(`Node B received: ${message}`);
+  console.log(`Node B received: ${message}`);
 
-    // Broadcast the message to clients connected to Node B.
-    broadcastToClients(message);
+  // Generate a unique ID for this browser message.
+  const messageId = crypto.randomUUID();
 
-    // Prepare a packet for Server Node A.
-    const packet = JSON.stringify({
-      type: 'chat',
-      text: message
-    });
+  // Remember the ID before broadcasting locally.
+  rememberMessageId(messageId);
 
-    // Queue the message and attempt delivery to Node A.
-    sendToPeer(packet);
+  // Create a structured packet for Node A.
+  const packet = JSON.stringify({
+    type: 'chat',
+    id: messageId,
+    text: message
   });
 
+  // Preserve the current local chat behavior.
+  broadcastToClients(message);
+
+  // Queue the message for delivery to Node A.
+  sendToPeer(packet);
+   });
   // Remove a browser client when it disconnects.
   socket.on('close', () => {
     clients.delete(socket);

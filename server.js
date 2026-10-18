@@ -1,5 +1,6 @@
 
 const WebSocket = require('ws');
+const crypto = require('crypto');
 
 // Port used by Server Node A.
 const PORT = 8080;
@@ -12,6 +13,29 @@ const server = new WebSocket.Server({ port: PORT });
 
 // Track browser clients connected directly to Node A.
 const clients = new Set();
+
+// Track message IDs to prevent duplicate processing.
+const seenMessageIds = new Set();
+
+// Keep the deduplication cache within a reasonable size.
+const MAX_SEEN_MESSAGE_IDS = 5000;
+
+// Remember a message ID if it has not already been processed.
+function rememberMessageId(messageId) {
+  if (seenMessageIds.has(messageId)) {
+    return false;
+  }
+
+  seenMessageIds.add(messageId);
+
+  // Remove the oldest ID when the cache reaches its limit.
+  if (seenMessageIds.size > MAX_SEEN_MESSAGE_IDS) {
+    const oldestId = seenMessageIds.values().next().value;
+    seenMessageIds.delete(oldestId);
+  }
+
+  return true;
+}
 
 // Store the connection to Node B.
 let peerSocket = null;
@@ -194,12 +218,25 @@ function connectToNodeB() {
 });
 
 
-  peer.on('message', (data) => {
+ peer.on('message', (data) => {
   try {
     const packet = JSON.parse(data.toString());
 
-    if (packet.type === 'chat' && typeof packet.text === 'string') {
+    // Accept only valid chat packets with an ID and text.
+    if (
+      packet.type === 'chat' &&
+      typeof packet.id === 'string' &&
+      typeof packet.text === 'string'
+    ) {
+      // Ignore messages that have already been processed.
+      if (!rememberMessageId(packet.id)) {
+        console.log('Duplicate message ignored:', packet.id);
+        return;
+      }
+
       console.log('Received message from Node B:', packet.text);
+
+      // Display the original text in Node A's browser clients.
       broadcastToClients(packet.text);
     }
   } catch (error) {
@@ -238,26 +275,30 @@ server.on('connection', (socket) => {
 
   console.log(`Client connected to Node A. Total: ${clients.size}`);
 
-  // Receive a message from a browser.
   socket.on('message', (data) => {
-    // Convert incoming data into a string.
-    const message = data.toString();
+  const message = data.toString();
 
-    console.log(`Node A received: ${message}`);
+  console.log(`Node A received: ${message}`);
 
-    // Deliver the message to local browser clients.
-    broadcastToClients(message);
+  // Generate a unique ID for this new browser message.
+  const messageId = crypto.randomUUID();
 
-    // Prepare a JSON packet for Node B.
-    const packet = JSON.stringify({
-      type: 'chat',
-      text: message
-    });
+  // Record the ID so a repeated message can be detected.
+  rememberMessageId(messageId);
 
-    // Queue the message and attempt to deliver it to Node B.
-    sendToPeer(packet);
+  // Prepare the structured message packet.
+  const packet = JSON.stringify({
+    type: 'chat',
+    id: messageId,
+    text: message
   });
 
+  // Preserve the current local chat behavior.
+  broadcastToClients(message);
+
+  // Queue the packet for delivery to Node B.
+  sendToPeer(packet);
+});
   // Remove a browser client when it disconnects.
   socket.on('close', () => {
     clients.delete(socket);
