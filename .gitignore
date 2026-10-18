@@ -1,19 +1,41 @@
 # Node.js dependencies
 node_modules/
-npm-debug.log
-yarn-error.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
 
-# Environment files
+# Environment variables
 .env
+.env.local
+.env.*.local
 
-# OS junk
+# Logs
+*.log
+logs/
+pids/
+*.pid
+*.seed
+
+# Build output
+dist/
+build/
+coverage/
+.tmp/
+
+# OS-specific files
 .DS_Store
 Thumbs.db
 
-# Build artifacts
-dist/
-build/
+# IDE/editor settings
+.vscode/
+.idea/
+*.swp
 
-# Python cache (if mixed with Python)
-__pycache__/
-*.pyc
+# Cache
+.cache/
+.parcel-cache/
+.next/
+out/
+
+# Testing
+jest-html-reporters-*

@@ -226,7 +226,7 @@ function connectToNodeB() {
 });
 
   peer.on('error', () => {
-  // The close handler schedules the next attempt.
+  
   // Avoid logging a separate error for every failed attempt.
 });
 }
