@@ -1,0 +1,322 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <!-- Defines the character encoding used by the page. -->
+  <meta charset="UTF-8">
+
+  <!-- Makes the page display correctly on phones and desktops. -->
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+  <!-- The title shown in the browser tab. -->
+  <title>Distributed Chat</title>
+
+  <style>
+    /* Styles the entire page. */
+    body {
+      font-family: Arial, sans-serif;
+      max-width: 700px;
+      margin: 40px auto;
+      padding: 20px;
+      background: #f4f5f9;
+      color: #222;
+    }
+
+    /* Styles the main chat panel. */
+    .chat-container {
+      background: white;
+      padding: 24px;
+      border-radius: 12px;
+      box-shadow: 0 4px 14px rgba(0, 0, 0, 0.08);
+    }
+
+    /* Gives each input a consistent layout. */
+    input {
+      box-sizing: border-box;
+      padding: 12px;
+      margin: 6px 0;
+      width: 100%;
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      font-size: 16px;
+    }
+
+    /* Styles the Send button. */
+    button {
+      padding: 12px 20px;
+      margin-top: 8px;
+      background: #5138c4;
+      color: white;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 16px;
+    }
+
+    /* Changes the button appearance when hovered over. */
+    button:hover {
+      background: #3e2a9b;
+    }
+
+    /* Displays the connection status. */
+    #status {
+      margin: 12px 0;
+      font-weight: bold;
+    }
+
+    /* Creates a scrollable area for chat messages. */
+    #chat {
+      height: 280px;
+      overflow-y: auto;
+      border: 1px solid #ddd;
+      border-radius: 6px;
+      padding: 12px;
+      margin-top: 16px;
+      background: #fafafa;
+      overflow-wrap: anywhere;
+    }
+
+    /* Styles individual messages and system notifications. */
+    .message {
+      padding: 8px;
+      margin: 6px 0;
+      border-radius: 5px;
+      background: #eee;
+    }
+
+    .system-message {
+      color: #555;
+      font-style: italic;
+    }
+  </style>
+</head>
+
+<body>
+  <div class="chat-container">
+    <!-- Main heading displayed above the chat. -->
+    <h1>Distributed Chat</h1>
+
+    <!-- Lets the user choose a display name. -->
+    <label for="username">Your username</label>
+    <input
+      id="username"
+      type="text"
+      placeholder="Enter your username"
+      maxlength="20"
+    >
+
+    <!-- Shows whether the WebSocket connection is ready. -->
+    <p id="status">Connecting to server...</p>
+
+    <!-- Input where the user writes a message. -->
+    <label for="msg">Your message</label>
+    <input
+      id="msg"
+      type="text"
+      placeholder="Type a message..."
+      maxlength="500"
+    >
+
+    <!-- Clicking this button calls the sendMessage function. -->
+    <button id="sendButton" type="button">Send</button>
+
+    <!-- Messages and connection notifications appear here. -->
+    <div id="chat" aria-live="polite"></div>
+  </div>
+
+  
+<script>
+  // Address of Node A's WebSocket server.
+  const SERVER_URL = 'ws://localhost:8080';
+
+  // Find the HTML elements used by the chat.
+  const usernameInput = document.getElementById('username');
+  const messageInput = document.getElementById('msg');
+  const sendButton = document.getElementById('sendButton');
+  const status = document.getElementById('status');
+  const chat = document.getElementById('chat');
+
+  // Use let because the WebSocket will be replaced after disconnection.
+  let socket = null;
+
+  // Stores the pending reconnection timer.
+  let reconnectTimer = null;
+
+  // Wait two seconds before attempting to reconnect.
+  const RECONNECT_DELAY = 2000;
+
+  // Prevent duplicate reconnection timers.
+  let reconnecting = false;
+
+  // Safely display a message in the chat area.
+  function displayMessage(text, isSystemMessage = false) {
+    const paragraph = document.createElement('p');
+
+    paragraph.className = isSystemMessage
+      ? 'system-message'
+      : 'message';
+
+    // Display the message as plain text, not HTML.
+    paragraph.textContent = text;
+
+    chat.appendChild(paragraph);
+
+    // Scroll down to the latest message.
+    chat.scrollTop = chat.scrollHeight;
+  }
+
+  // Connect the browser to Node A.
+  function connectToServer() {
+    // Do not create another connection if one is already active.
+    if (
+      socket &&
+      (socket.readyState === WebSocket.CONNECTING ||
+       socket.readyState === WebSocket.OPEN)
+    ) {
+      return;
+    }
+
+    reconnecting = false;
+
+    status.textContent = 'Connecting to server...';
+    status.style.color = '';
+
+    // Disable sending until the connection is established.
+    sendButton.disabled = true;
+
+    // Create a fresh WebSocket connection to Node A.
+    const newSocket = new WebSocket(SERVER_URL);
+
+    // Save the new connection for message sending.
+    socket = newSocket;
+
+    // Runs when the connection succeeds.
+    newSocket.addEventListener('open', () => {
+      // Ignore events from an old connection.
+      if (socket !== newSocket) return;
+
+      status.textContent = 'Connected to server';
+      status.style.color = 'green';
+
+      sendButton.disabled = false;
+
+      displayMessage('Connected to the chat server.', true);
+
+      // Cancel any outstanding reconnect timer.
+      if (reconnectTimer !== null) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+
+      reconnecting = false;
+    });
+
+    // Runs when Node A sends a message to this browser.
+    newSocket.addEventListener('message', (event) => {
+      if (socket !== newSocket) return;
+
+      displayMessage(event.data);
+    });
+
+    // Runs when the WebSocket connection closes.
+    newSocket.addEventListener('close', () => {
+      // Ignore close events from an older connection.
+      if (socket !== newSocket) return;
+
+      status.textContent = 'Disconnected. Reconnecting...';
+      status.style.color = 'red';
+
+      sendButton.disabled = true;
+
+      displayMessage(
+        'Connection closed. Trying to reconnect...',
+        true
+      );
+
+      scheduleReconnect();
+    });
+
+    // Runs when a connection error occurs.
+    newSocket.addEventListener('error', (error) => {
+      console.error('WebSocket connection error:', error);
+
+      status.textContent = 'Connection error. Reconnecting...';
+      status.style.color = 'red';
+
+      // The close event normally follows and schedules a retry.
+    });
+  }
+
+  // Schedule one reconnection attempt.
+  function scheduleReconnect() {
+    if (reconnecting || reconnectTimer !== null) {
+      return;
+    }
+
+    reconnecting = true;
+
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      reconnecting = false;
+
+      // Try to establish a new connection.
+      connectToServer();
+    }, RECONNECT_DELAY);
+  }
+
+  // Send a message to Node A.
+  function sendMessage() {
+    const username = usernameInput.value.trim();
+    const message = messageInput.value.trim();
+
+    // Require a username.
+    if (username === '') {
+      displayMessage('Please enter a username first.', true);
+      usernameInput.focus();
+      return;
+    }
+
+    // Ignore empty messages.
+    if (message === '') {
+      return;
+    }
+
+    // Confirm that the current WebSocket is open.
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      displayMessage(
+        'Cannot send: waiting for server connection.',
+        true
+      );
+      return;
+    }
+
+    // Include the username in the message.
+    const fullMessage = username + ': ' + message;
+
+    // Send the message to Node A.
+    socket.send(fullMessage);
+
+    // Clear the message field after sending.
+    messageInput.value = '';
+    messageInput.focus();
+  }
+
+  // Send messages when the Send button is clicked.
+  sendButton.addEventListener('click', sendMessage);
+
+  // Allow Enter to send a message.
+  messageInput.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      sendMessage();
+    }
+  });
+
+  // Keep sending disabled until Node A is connected.
+  sendButton.disabled = true;
+
+  // Establish the first connection.
+  connectToServer();
+</script>
+</body>
+</html>
