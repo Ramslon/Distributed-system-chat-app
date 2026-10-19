@@ -61,6 +61,15 @@ const pendingMessages = [];
 // Store IDs of messages that have been sent but not yet acknowledged.
 const awaitingAcks = new Set();
 
+// Wait this long for an ACK before retrying a message.
+const ACK_TIMEOUT_MS = 5000;
+
+// Track the timeout associated with each in-flight message.
+const ackTimers = new Map();
+
+// Count retries for each message ID.
+const retryCounts = new Map();
+
 // Limit the queue to prevent unlimited memory growth.
 const MAX_PENDING_MESSAGES = 1000;
 
@@ -97,9 +106,65 @@ function sendToPeer(packet) {
   flushPendingMessages();
 }
 
-// Remove a message from the queue only after its ACK arrives.
+// Cancel the ACK timeout associated with a message.
+function clearAckTimer(messageId) {
+  const timer = ackTimers.get(messageId);
+
+  if (timer) {
+    clearTimeout(timer);
+    ackTimers.delete(messageId);
+  }
+}
+
+// Retry a message when its ACK does not arrive in time.
+function scheduleAckTimeout(messageId) {
+  // Prevent multiple timers for the same message.
+  clearAckTimer(messageId);
+
+  const timer = setTimeout(() => {
+    ackTimers.delete(messageId);
+
+    // The message may have been acknowledged while the timer
+    // was waiting to execute.
+    if (!awaitingAcks.has(messageId)) {
+      return;
+    }
+
+    // If the message was removed from the queue, nothing remains
+    // to retry.
+    const stillQueued = pendingMessages.some((queuedPacket) => {
+      try {
+        return JSON.parse(queuedPacket).id === messageId;
+      } catch (error) {
+        return false;
+      }
+    });
+
+    if (!stillQueued) {
+      awaitingAcks.delete(messageId);
+      retryCounts.delete(messageId);
+      return;
+    }
+
+    const retries = (retryCounts.get(messageId) || 0) + 1;
+    retryCounts.set(messageId, retries);
+
+    console.log(
+      `ACK timeout for ${messageId}. Retry attempt ${retries}.`
+    );
+
+    // Allow flushPendingMessages() to resend the same packet.
+    awaitingAcks.delete(messageId);
+    flushingQueue = false;
+
+    flushPendingMessages();
+  }, ACK_TIMEOUT_MS);
+
+  ackTimers.set(messageId, timer);
+}
+
+// Remove a message only after its ACK arrives.
 function acknowledgeMessage(messageId) {
-  // Find the queued message with the acknowledged ID.
   const index = pendingMessages.findIndex((queuedPacket) => {
     try {
       return JSON.parse(queuedPacket).id === messageId;
@@ -108,7 +173,11 @@ function acknowledgeMessage(messageId) {
     }
   });
 
-  // Remove the message if it is still waiting in the queue.
+  // Stop any timeout and clear retry tracking.
+  clearAckTimer(messageId);
+  awaitingAcks.delete(messageId);
+  retryCounts.delete(messageId);
+
   if (index !== -1) {
     pendingMessages.splice(index, 1);
 
@@ -120,10 +189,7 @@ function acknowledgeMessage(messageId) {
     console.log(`ACK received for message: ${messageId}`);
   }
 
-  // The message no longer needs an acknowledgement.
-  awaitingAcks.delete(messageId);
-
-  // Continue with the next queued message.
+  // Continue processing the next queued message.
   flushPendingMessages();
 }
 
@@ -138,22 +204,17 @@ function sendAcknowledgement(peer, messageId) {
 }
 
 
-// Send one queued message and wait for its ACK before sending the next.
+// Send the oldest queued message and wait for its ACK.
 function flushPendingMessages() {
-  // Avoid processing the queue concurrently.
   if (flushingQueue) return;
 
-  // A connection to Node B must be open.
   if (!peerSocket || peerSocket.readyState !== WebSocket.OPEN) {
     return;
   }
 
-  // Nothing needs to be delivered.
   if (pendingMessages.length === 0) return;
 
-  // Always process the oldest queued message first.
   const packet = pendingMessages[0];
-
   let messageId;
 
   try {
@@ -163,39 +224,57 @@ function flushPendingMessages() {
     return;
   }
 
-  // Do not resend a message while waiting for its ACK.
+  // Do not send a message that is already awaiting its ACK.
   if (awaitingAcks.has(messageId)) return;
 
   flushingQueue = true;
-
   const currentPeer = peerSocket;
 
-  // Mark the message as awaiting an ACK before sending.
+  // Track the message before sending it.
   awaitingAcks.add(messageId);
 
-  console.log(`Sending message ${messageId} to Node B`);
+  console.log(`Sending message ${messageId} to peer`);
 
   currentPeer.send(packet, (error) => {
     flushingQueue = false;
 
-    // Keep the queued message if delivery failed.
     if (error) {
-      awaitingAcks.delete(messageId);
+  console.error(
+    'Message send failed; keeping it queued:',
+    error.message
+  );
 
-      console.error(
-        'Message send failed; keeping it queued:',
-        error.message
-      );
+  // Keep tracking the message and retry after the timeout.
+  // The peer's close handler will clear this state if it disconnects.
+  scheduleAckTimeout(messageId);
 
-      return;
-    }
-
-    // Do not remove the message here.
-    // We remove it only when acknowledgeMessage() receives its ACK.
-    console.log(`Waiting for ACK for message ${messageId}`);
-  });
+  return;
 }
 
+    // The ACK might already have arrived before this callback.
+    const stillQueued = pendingMessages.some((queuedPacket) => {
+      try {
+        return JSON.parse(queuedPacket).id === messageId;
+      } catch (parseError) {
+        return false;
+      }
+    });
+
+    if (
+      stillQueued &&
+      awaitingAcks.has(messageId) &&
+      peerSocket === currentPeer
+    ) {
+      console.log(`Waiting for ACK for message ${messageId}`);
+      scheduleAckTimeout(messageId);
+    }
+
+    // If an ACK already removed this packet, process the next one.
+    if (!stillQueued) {
+      flushPendingMessages();
+    }
+  });
+}
 
 function scheduleReconnect() {
   // Do not create multiple reconnection timers.
@@ -311,23 +390,29 @@ peer.on('message', (data) => {
   }
 });
 
-  // Handle a closed or failed peer connection.
- peer.on('close', () => {
+  peer.on('close', () => {
   // Ignore events from an old connection.
   if (peerSocket !== peer) {
     return;
   }
 
-  // Mark the peer as unavailable.
+  // Mark Node B as disconnected.
   peerConnected = false;
   peerSocket = null;
 
-  awaitingAcks.clear();
+  // Cancel ACK timers for messages that will be retried.
+  for (const timer of ackTimers.values()) {
+    clearTimeout(timer);
+  }
 
-  // Log the disconnect only once for this connection.
+  ackTimers.clear();
+  awaitingAcks.clear();
+  retryCounts.clear();
+  flushingQueue = false;
+
   console.log('Connection to Node B closed.');
 
-  // Schedule the next attempt.
+  // Automatically reconnect to Node B.
   scheduleReconnect();
 });
 
