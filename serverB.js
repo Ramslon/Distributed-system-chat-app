@@ -40,6 +40,9 @@ let peerSocket = null;
 // Stores messages waiting to be delivered to Node A.
 const pendingMessages = [];
 
+// Track messages sent to Node A that are awaiting ACKs.
+const awaitingAcks = new Set();
+
 // Limit the queue to prevent unlimited memory growth.
 const MAX_PENDING_MESSAGES = 1000;
 
@@ -75,55 +78,101 @@ function sendToPeer(packet) {
   flushPendingMessages();
 }
 
-// Deliver queued messages to Node A in order.
-function flushPendingMessages() {
-  // Stop if another flush is in progress.
-  if (flushingQueue) {
-    return;
+// Remove a message from the queue only after its ACK arrives.
+function acknowledgeMessage(messageId) {
+  // Find the queued message with the acknowledged ID.
+  const index = pendingMessages.findIndex((queuedPacket) => {
+    try {
+      return JSON.parse(queuedPacket).id === messageId;
+    } catch (error) {
+      return false;
+    }
+  });
+
+  // Remove the message if it is still waiting in the queue.
+  if (index !== -1) {
+    pendingMessages.splice(index, 1);
+
+    console.log(`Message acknowledged: ${messageId}`);
+    console.log(
+      `Remaining queued messages: ${pendingMessages.length}`
+    );
+  } else {
+    console.log(`ACK received for message: ${messageId}`);
   }
 
-  // Stop if Node A is not connected.
+  // The message no longer needs an acknowledgement.
+  awaitingAcks.delete(messageId);
+
+  // Continue with the next queued message.
+  flushPendingMessages();
+}
+
+// Send an acknowledgement to the peer server.
+function sendAcknowledgement(peer, messageId) {
+  if (peer && peer.readyState === WebSocket.OPEN) {
+    peer.send(JSON.stringify({
+      type: 'ack',
+      id: messageId
+    }));
+  }
+}
+
+// Send one queued message and wait for its ACK before sending the next.
+function flushPendingMessages() {
+  // Avoid processing the queue concurrently.
+  if (flushingQueue) return;
+
+  // A connection to Node B must be open.
   if (!peerSocket || peerSocket.readyState !== WebSocket.OPEN) {
     return;
   }
 
-  // Stop if there are no messages waiting.
-  if (pendingMessages.length === 0) {
+  // Nothing needs to be delivered.
+  if (pendingMessages.length === 0) return;
+
+  // Always process the oldest queued message first.
+  const packet = pendingMessages[0];
+
+  let messageId;
+
+  try {
+    messageId = JSON.parse(packet).id;
+  } catch (error) {
+    console.error('Invalid queued message:', error.message);
     return;
   }
 
-  // Mark the queue as being processed.
+  // Do not resend a message while waiting for its ACK.
+  if (awaitingAcks.has(messageId)) return;
+
   flushingQueue = true;
 
-  // Keep the first message in the queue until send completes.
-  const packet = pendingMessages[0];
-
-  // Remember which connection is sending this message.
   const currentPeer = peerSocket;
 
-  // Send the first queued message to Node B.
+  // Mark the message as awaiting an ACK before sending.
+  awaitingAcks.add(messageId);
+
+  console.log(`Sending message ${messageId} to Node A`);
+
   currentPeer.send(packet, (error) => {
-    // Allow the next flush attempt.
     flushingQueue = false;
 
-    // Keep the message queued if sending failed.
+    // Keep the queued message if delivery failed.
     if (error) {
-      console.error('Queued message delivery failed:', error.message);
+      awaitingAcks.delete(messageId);
+
+      console.error(
+        'Message send failed; keeping it queued:',
+        error.message
+      );
+
       return;
     }
 
-    // Remove the message only if it is still at the front.
-    if (pendingMessages[0] === packet) {
-      pendingMessages.shift();
-    }
-
-    // Send the next message if this connection remains open.
-    if (
-      peerSocket === currentPeer &&
-      currentPeer.readyState === WebSocket.OPEN
-    ) {
-      flushPendingMessages();
-    }
+    // Do not remove the message here.
+    // We remove it only when acknowledgeMessage() receives its ACK.
+    console.log(`Waiting for ACK for message ${messageId}`);
   });
 }
 
@@ -151,30 +200,47 @@ server.on('connection', (socket, request) => {
   try {
     const packet = JSON.parse(data.toString());
 
-    // Accept only valid chat packets with a message ID.
+    // Handle an acknowledgement from Node A.
+    if (
+      packet.type === 'ack' &&
+      typeof packet.id === 'string'
+    ) {
+      acknowledgeMessage(packet.id);
+      return;
+    }
+
+    // Handle a chat message from Node A.
     if (
       packet.type === 'chat' &&
       typeof packet.id === 'string' &&
       typeof packet.text === 'string'
     ) {
-      // Ignore messages already processed by Node B.
+      // A duplicate still receives an ACK.
       if (!rememberMessageId(packet.id)) {
         console.log('Duplicate message ignored:', packet.id);
+        sendAcknowledgement(socket, packet.id);
         return;
       }
 
-      // Display the message to Node B's local browser clients.
+      // Deliver the message to Node B's browser clients.
       broadcastToClients(packet.text);
-     }
-     } catch (error) {
-    console.error('Invalid message received from Node A:', error.message);
-     }
-    });
+
+      // Tell Node A that the message was processed.
+      sendAcknowledgement(socket, packet.id);
+    }
+  } catch (error) {
+    console.error(
+      'Invalid message received from Node A:',
+      error.message
+    );
+  }
+});
 
     // Clear the peer reference if this connection closes.
     socket.on('close', () => {
       if (peerSocket === socket) {
         peerSocket = null;
+        awaitingAcks.clear();
       }
 
       console.log('Connection from Server Node A closed');
