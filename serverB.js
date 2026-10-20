@@ -46,6 +46,12 @@ const awaitingAcks = new Set();
 // Wait this long for an ACK before retrying a message.
 const ACK_TIMEOUT_MS = 5000;
 
+// Maximum number of automatic retries after the initial send.
+const MAX_RETRIES = 5;
+
+// Messages that exhausted their retries and need later recovery.
+const failedMessages = new Map();
+
 // Track the timeout associated with each in-flight message.
 const ackTimers = new Map();
 
@@ -72,20 +78,30 @@ function broadcastToClients(message) {
   });
 }
 
-// Add a message to the queue and attempt delivery.
+
 function sendToPeer(packet) {
-  // Prevent the queue from growing beyond its configured limit.
+  // Reject the message if the pending queue is full.
   if (pendingMessages.length >= MAX_PENDING_MESSAGES) {
-    console.error('Message queue full. Message was not queued.');
-    return;
+    console.error(
+      `Message queue full (${MAX_PENDING_MESSAGES}). Message was not queued.`
+    );
+
+    return false;
   }
 
-  // Add the message to the end of the queue.
+  // Add the packet to the end of the pending queue.
   pendingMessages.push(packet);
 
-  // Try to deliver queued messages.
+  console.log(
+    `Queued message. Pending count: ${pendingMessages.length}`
+  );
+
+  // Attempt to deliver queued messages.
   flushPendingMessages();
+
+  return true;
 }
+
 
 // Cancel the ACK timeout associated with a message.
 function clearAckTimer(messageId) {
@@ -130,6 +146,38 @@ function scheduleAckTimeout(messageId) {
     const retries = (retryCounts.get(messageId) || 0) + 1;
     retryCounts.set(messageId, retries);
 
+    // Stop automatic retries after the configured limit.
+   if (retries > MAX_RETRIES) {
+  const index = pendingMessages.findIndex((queuedPacket) => {
+    try {
+      return JSON.parse(queuedPacket).id === messageId;
+    } catch (error) {
+      return false;
+    }
+  });
+
+  if (index !== -1) {
+    const [failedPacket] = pendingMessages.splice(index, 1);
+    failedMessages.set(messageId, failedPacket);
+  }
+
+  awaitingAcks.delete(messageId);
+  retryCounts.delete(messageId);
+
+  console.error(
+    `Message ${messageId} failed after ${MAX_RETRIES} retries.`
+  );
+
+  console.error(
+    `Messages awaiting recovery: ${failedMessages.size}`
+  );
+
+  // Continue processing any remaining queued messages.
+  flushingQueue = false;
+  flushPendingMessages();
+  return;
+  }
+
     console.log(
       `ACK timeout for ${messageId}. Retry attempt ${retries}.`
     );
@@ -159,19 +207,25 @@ function acknowledgeMessage(messageId) {
   awaitingAcks.delete(messageId);
   retryCounts.delete(messageId);
 
+  const wasPreviouslyFailed = failedMessages.delete(messageId);
+
   if (index !== -1) {
-    pendingMessages.splice(index, 1);
+  pendingMessages.splice(index, 1);
 
-    console.log(`Message acknowledged: ${messageId}`);
-    console.log(
-      `Remaining queued messages: ${pendingMessages.length}`
-    );
-  } else {
-    console.log(`ACK received for message: ${messageId}`);
-  }
+  console.log(`Message acknowledged: ${messageId}`);
+  console.log(
+    `Remaining queued messages: ${pendingMessages.length}`
+  );
+} else if (wasPreviouslyFailed) {
+  console.log(
+    `Late ACK received; recovered failed message: ${messageId}`
+  );
+} else {
+  console.log(`ACK received for message: ${messageId}`);
+}
 
-  // Continue processing the next queued message.
-  flushPendingMessages();
+// Continue processing the next queued message.
+flushPendingMessages();
 }
 
 // Send an acknowledgement to the peer server.
@@ -298,16 +352,16 @@ socket.on('message', (data) => {
     ) {
       // Duplicate messages must still receive an ACK.
       if (!rememberMessageId(packet.id)) {
-        console.log('Duplicate message ignored:', packet.id);
-
-        sendAcknowledgement(socket, packet.id);
-        return;
-      }
+  console.log('Duplicate message ignored:', packet.id);
+  sendAcknowledgement(socket, packet.id);
+  return;
+}
 
       // Deliver the new message to Node B's browser clients.
       broadcastToClients(packet.text);
 
-      
+      // Normally acknowledge the processed message.
+      sendAcknowledgement(socket, packet.id);
     }
   } catch (error) {
     console.error(
@@ -371,8 +425,15 @@ socket.on('message', (data) => {
   // Preserve the current local chat behavior.
   broadcastToClients(message);
 
-  // Queue the message for delivery to Node A.
-  sendToPeer(packet);
+  // Queue the message for delivery to the peer.
+const queued = sendToPeer(packet);
+
+// Inform the sender if the queue is full.
+if (!queued && socket.readyState === WebSocket.OPEN) {
+  socket.send(
+    'System: Message was not queued because the pending queue is full. Please try again later.'
+  );
+}
    });
   // Remove a browser client when it disconnects.
   socket.on('close', () => {
