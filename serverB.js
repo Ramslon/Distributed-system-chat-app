@@ -11,6 +11,7 @@ const server = new WebSocket.Server({ port: PORT });
 // Store browser clients connected directly to Node B.
 const clients = new Set();
 
+
 // Track message IDs to prevent duplicate processing.
 const seenMessageIds = new Set();
 
@@ -80,28 +81,64 @@ function broadcastToClients(message) {
 
 
 function sendToPeer(packet) {
-  // Reject the message if the pending queue is full.
+  let messageId;
+
+  // Read the message ID from the packet.
+  try {
+    const parsedPacket = JSON.parse(packet);
+    messageId = parsedPacket.id;
+  } catch (error) {
+    console.error('Cannot queue invalid message packet:', error.message);
+    return false;
+  }
+
+  if (typeof messageId !== 'string' || messageId.length === 0) {
+    console.error('Cannot queue a packet without a valid message ID.');
+    return false;
+  }
+
+  // Prevent the same message ID from entering the queue twice.
+  const alreadyQueued = pendingMessages.some((queuedPacket) => {
+    try {
+      return JSON.parse(queuedPacket).id === messageId;
+    } catch (error) {
+      return false;
+    }
+  });
+
+  if (alreadyQueued) {
+    console.log(`Duplicate queue entry prevented: ${messageId}`);
+    return true;
+  }
+
+  // Do not enqueue a message that is already marked as failed.
+  if (failedMessages.has(messageId)) {
+    console.log(
+      `Message ${messageId} is already failed and awaiting recovery.`
+    );
+    return true;
+  }
+
+  // Reject a new message if the pending queue is full.
   if (pendingMessages.length >= MAX_PENDING_MESSAGES) {
     console.error(
       `Message queue full (${MAX_PENDING_MESSAGES}). Message was not queued.`
     );
-
     return false;
   }
 
-  // Add the packet to the end of the pending queue.
+  // Add the packet to the end of the queue.
   pendingMessages.push(packet);
 
   console.log(
     `Queued message. Pending count: ${pendingMessages.length}`
   );
 
-  // Attempt to deliver queued messages.
+  // Attempt delivery.
   flushPendingMessages();
 
   return true;
 }
-
 
 // Cancel the ACK timeout associated with a message.
 function clearAckTimer(messageId) {
@@ -228,8 +265,9 @@ function acknowledgeMessage(messageId) {
 flushPendingMessages();
 }
 
-// Send an acknowledgement to the peer server.
+
 function sendAcknowledgement(peer, messageId) {
+
   if (peer && peer.readyState === WebSocket.OPEN) {
     peer.send(JSON.stringify({
       type: 'ack',
@@ -406,9 +444,10 @@ socket.on('message', (data) => {
 
   socket.on('message', (data) => {
   const message = data.toString();
+  
 
   console.log(`Node B received: ${message}`);
-
+  
   // Generate a unique ID for this browser message.
   const messageId = crypto.randomUUID();
 

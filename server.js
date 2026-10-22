@@ -158,30 +158,67 @@ function broadcastToClients(message) {
   });
 }
 
-// Add a message to the queue and attempt delivery.
 
 function sendToPeer(packet) {
-  // Reject the message if the pending queue is full.
+  let messageId;
+
+  // Read the message ID from the packet.
+  try {
+    const parsedPacket = JSON.parse(packet);
+    messageId = parsedPacket.id;
+  } catch (error) {
+    console.error('Cannot queue invalid message packet:', error.message);
+    return false;
+  }
+
+  if (typeof messageId !== 'string' || messageId.length === 0) {
+    console.error('Cannot queue a packet without a valid message ID.');
+    return false;
+  }
+
+  // Prevent the same message ID from entering the queue twice.
+  const alreadyQueued = pendingMessages.some((queuedPacket) => {
+    try {
+      return JSON.parse(queuedPacket).id === messageId;
+    } catch (error) {
+      return false;
+    }
+  });
+
+  if (alreadyQueued) {
+    console.log(`Duplicate queue entry prevented: ${messageId}`);
+    return true;
+  }
+
+  // Do not enqueue a message that is already marked as failed.
+  if (failedMessages.has(messageId)) {
+    console.log(
+      `Message ${messageId} is already failed and awaiting recovery.`
+    );
+    return true;
+  }
+
+  // Reject a new message if the pending queue is full.
   if (pendingMessages.length >= MAX_PENDING_MESSAGES) {
     console.error(
       `Message queue full (${MAX_PENDING_MESSAGES}). Message was not queued.`
     );
-
     return false;
   }
 
-  // Add the packet to the end of the pending queue.
+  // Add the packet to the end of the queue.
   pendingMessages.push(packet);
 
   console.log(
     `Queued message. Pending count: ${pendingMessages.length}`
   );
 
-  // Attempt to deliver queued messages.
+  // Attempt delivery.
   flushPendingMessages();
 
   return true;
 }
+
 
 
 // Cancel the ACK timeout associated with a message.
@@ -556,6 +593,38 @@ server.on('connection', (socket) => {
   const message = data.toString();
 
   console.log(`Node A received: ${message}`);
+
+  
+  // Handle a manual failed-message recovery command.
+  if (message.trim().toLowerCase() === '/recover') {
+    const failedBefore = failedMessages.size;
+
+    // Move eligible failed messages back into the pending queue.
+    recoverFailedMessages();
+
+    // Calculate how many failed entries were recovered.
+    const recovered = failedBefore - failedMessages.size;
+
+    // Resume delivery immediately if the peer is connected.
+    flushPendingMessages();
+
+    // Report the result only to the browser that requested recovery.
+    if (socket.readyState === WebSocket.OPEN) {
+      if (recovered > 0) {
+        socket.send(
+          `System: Recovered ${recovered} failed message(s).`
+        );
+      } else {
+        socket.send(
+          'System: No failed messages were available for recovery.'
+        );
+      }
+    }
+
+    // Do not process this command as a normal chat message.
+    return;
+  }
+
 
   // Generate a unique ID for this new browser message.
   const messageId = crypto.randomUUID();

@@ -289,11 +289,16 @@
       return;
     }
 
-    // Include the username in the message.
-    const fullMessage = username + ': ' + message;
+    
+    // Send commands without adding the username.
+    // Send ordinary chat messages with the username.
+    if (message.startsWith('/')) {
+      socket.send(message);
+    } else {
+      const fullMessage = username + ': ' + message;
+      socket.send(fullMessage);
+    }
 
-    // Send through the current WebSocket.
-    socket.send(fullMessage);
 
     // Clear the message field.
     messageInput.value = '';
