@@ -1,9 +1,53 @@
 
+require('dotenv').config();
+
 const WebSocket = require('ws');
 const crypto = require('crypto');
+const jwt = require('jsonwebtoken');
+
+// The API and Node A must use the same JWT secret.
+if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) {
+  throw new Error(
+    'JWT_SECRET is missing or too short. Check your .env file.'
+  );
+}
+
+/**
+ * Verify a login token and return the trusted user identity.
+ * Return null if the token is invalid or expired.
+ */
+function verifyAuthToken(token) {
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+
+    if (
+      typeof decoded.sub !== 'string' ||
+      typeof decoded.username !== 'string'
+    ) {
+      return null;
+    }
+
+    return {
+      id: decoded.sub,
+      username: decoded.username
+    };
+  } catch (error) {
+    // Invalid, expired or incorrectly signed token.
+    return null;
+  }
+}
+
+if (
+  !process.env.INTERNAL_PEER_SECRET ||
+  process.env.INTERNAL_PEER_SECRET.length < 32
+) {
+  throw new Error(
+    'INTERNAL_PEER_SECRET is missing or too short. Check your .env file.'
+  );
+}
 
 // Port used by Server Node A.
-const PORT = 8080;
+const PORT = 8090;
 
 // Address of Server Node B.
 const NODE_B_URL = 'ws://localhost:8081/?peer=A';
@@ -39,6 +83,9 @@ function rememberMessageId(messageId) {
 
 // Store the connection to Node B.
 let peerSocket = null;
+
+//Track whether Node B has authenticated
+let peerAuthenticated = false;
 
 // Stores the scheduled reconnection timer.
 let reconnectTimer = null;
@@ -361,8 +408,12 @@ function sendAcknowledgement(peer, messageId) {
 function flushPendingMessages() {
   if (flushingQueue) return;
 
-  if (!peerSocket || peerSocket.readyState !== WebSocket.OPEN) {
-    return;
+  if (
+  !peerSocket ||
+  peerSocket.readyState !== WebSocket.OPEN ||
+  !peerAuthenticated
+  ) {
+  return;
   }
 
   if (pendingMessages.length === 0) return;
@@ -487,29 +538,43 @@ function connectToNodeB() {
 
  
 peer.on('open', () => {
-  // Ignore events from an outdated connection.
   if (peerSocket !== peer) {
     return;
   }
 
-  // Mark Node B as connected.
-  peerConnected = true;
+  // Node B must authenticate this server before chat traffic starts.
+  peerAuthenticated = false;
 
-  // Reset the retry count after a successful connection.
-  reconnectAttempts = 0;
+  peer.send(JSON.stringify({
+    type: 'peer_auth',
+    secret: process.env.INTERNAL_PEER_SECRET
+  }));
 
-  console.log('Successfully connected to Node B');
-
-  // Recover messages that previously exhausted their retries.
-  recoverFailedMessages();
-
-  // Resume delivery of pending messages.
-  flushPendingMessages();
+  console.log('Sent peer authentication to Node B.');
 });
 
 peer.on('message', (data) => {
   try {
     const packet = JSON.parse(data.toString());
+
+    // Wait for Node B to confirm the internal authentication handshake.
+  if (!peerAuthenticated) {
+  if (packet.type !== 'peer_auth_success') {
+    console.error('Node B did not confirm peer authentication.');
+    peer.close(1008, 'Peer authentication failed');
+    return;
+  }
+
+  peerAuthenticated = true;
+  peerConnected = true;
+  reconnectAttempts = 0;
+
+  console.log('Successfully authenticated with Node B.');
+
+  recoverFailedMessages();
+  flushPendingMessages();
+  return;
+  }
 
     // Handle an acknowledgement from Node B.
     if (
@@ -558,6 +623,7 @@ peer.on('message', (data) => {
 
   // Mark Node B as disconnected.
   peerConnected = false;
+  peerAuthenticated = false;
   peerSocket = null;
 
   // Cancel ACK timers for messages that will be retried.
@@ -582,88 +648,174 @@ peer.on('message', (data) => {
 });
 }
 
-// Accept browser connections to Node A.
-server.on('connection', (socket) => {
-  // Add this browser to the connected clients.
-  clients.add(socket);
 
-  console.log(`Client connected to Node A. Total: ${clients.size}`);
+/**
+ * Accept browser connections to Node A.
+ * A browser must authenticate before joining the client set.
+ */
+server.on('connection', (socket) => {
+  let authenticated = false;
+  let authTimer = null;
+
+  // Reject clients that never provide an authentication token.
+  authTimer = setTimeout(() => {
+    if (!authenticated) {
+      console.log('Unauthenticated connection rejected: timeout.');
+      socket.close(1008, 'Authentication required');
+    }
+  }, 5000);
 
   socket.on('message', (data) => {
-  const message = data.toString();
+    const incomingData = data.toString();
 
-  console.log(`Node A received: ${message}`);
+    // STEP 1: Require authentication as the first message.
+    if (!authenticated) {
+      let authPacket;
 
-  
-  // Handle a manual failed-message recovery command.
-  if (message.trim().toLowerCase() === '/recover') {
-    const failedBefore = failedMessages.size;
-
-    // Move eligible failed messages back into the pending queue.
-    recoverFailedMessages();
-
-    // Calculate how many failed entries were recovered.
-    const recovered = failedBefore - failedMessages.size;
-
-    // Resume delivery immediately if the peer is connected.
-    flushPendingMessages();
-
-    // Report the result only to the browser that requested recovery.
-    if (socket.readyState === WebSocket.OPEN) {
-      if (recovered > 0) {
-        socket.send(
-          `System: Recovered ${recovered} failed message(s).`
-        );
-      } else {
-        socket.send(
-          'System: No failed messages were available for recovery.'
-        );
+      try {
+        authPacket = JSON.parse(incomingData);
+      } catch (error) {
+        console.log('Rejected connection: invalid authentication packet.');
+        socket.close(1008, 'Authentication required');
+        return;
       }
+
+      if (
+        !authPacket ||
+        authPacket.type !== 'auth' ||
+        typeof authPacket.token !== 'string'
+      ) {
+        console.log('Rejected connection: authentication token missing.');
+        socket.close(1008, 'Authentication required');
+        return;
+      }
+
+      // Verify the JWT created by the login API.
+      const user = verifyAuthToken(authPacket.token);
+
+      if (!user) {
+        console.log('Rejected connection: invalid or expired token.');
+        socket.close(1008, 'Invalid or expired token');
+        return;
+      }
+
+      // Store the verified identity on this connection.
+      socket.username = user.username;
+      socket.userId = user.id;
+      authenticated = true;
+
+      clearTimeout(authTimer);
+      authTimer = null;
+
+      // Only authenticated browsers join the client set.
+      clients.add(socket);
+
+      console.log(
+        `Authenticated user ${socket.username} connected to Node A. ` +
+        `Total: ${clients.size}`
+      );
+
+      // Tell the browser authentication succeeded.
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({
+          type: 'auth_success',
+          user: {
+            id: socket.userId,
+            username: socket.username
+          }
+        }));
+      }
+
+      return;
     }
 
-    // Do not process this command as a normal chat message.
-    return;
-  }
+    // STEP 2: Ignore empty chat messages.
+    const userMessage = incomingData.trim();
 
+    if (!userMessage) {
+      return;
+    }
 
-  // Generate a unique ID for this new browser message.
-  const messageId = crypto.randomUUID();
+    // STEP 3: Handle the existing recovery command.
+    if (userMessage.toLowerCase() === '/recover') {
+      const failedBefore = failedMessages.size;
 
-  // Record the ID so a repeated message can be detected.
-  rememberMessageId(messageId);
+      recoverFailedMessages();
 
-  // Prepare the structured message packet.
-  const packet = JSON.stringify({
-    type: 'chat',
-    id: messageId,
-    text: message
+      const recovered = failedBefore - failedMessages.size;
+
+      flushPendingMessages();
+
+      if (socket.readyState === WebSocket.OPEN) {
+        if (recovered > 0) {
+          socket.send(
+            `System: Recovered ${recovered} failed message(s).`
+          );
+        } else {
+          socket.send(
+            'System: No failed messages were available for recovery.'
+          );
+        }
+      }
+
+      return;
+    }
+
+    // STEP 4: Build the sender identity from the verified token.
+    // Never accept the sender's identity from the browser message.
+    const message = `${socket.username}: ${userMessage}`;
+
+    console.log(`Node A received: ${message}`);
+
+    // STEP 5: Create a unique message ID.
+    const messageId = crypto.randomUUID();
+
+    rememberMessageId(messageId);
+
+    // STEP 6: Preserve the existing distributed message format.
+    const packet = JSON.stringify({
+      type: 'chat',
+      id: messageId,
+      text: message
+    });
+
+    // STEP 7: Broadcast locally and queue delivery to Node B.
+    broadcastToClients(message);
+
+    const queued = sendToPeer(packet);
+
+    // Notify the sender if the peer queue is full.
+    if (!queued && socket.readyState === WebSocket.OPEN) {
+      socket.send(
+        'System: Message was not queued because the pending queue is full. ' +
+        'Please try again later.'
+      );
+    }
   });
 
-  // Preserve the current local chat behavior.
-  broadcastToClients(message);
-
-  // Queue the message for delivery to the peer.
-const queued = sendToPeer(packet);
-
-// Inform the sender if the queue is full.
-if (!queued && socket.readyState === WebSocket.OPEN) {
-  socket.send(
-    'System: Message was not queued because the pending queue is full. Please try again later.'
-  );
-}
-});
-  // Remove a browser client when it disconnects.
+  // STEP 8: Clean up when the browser disconnects.
   socket.on('close', () => {
-    clients.delete(socket);
+    if (authTimer) {
+      clearTimeout(authTimer);
+      authTimer = null;
+    }
 
-    console.log(`Client disconnected from Node A. Total: ${clients.size}`);
+    if (authenticated) {
+      clients.delete(socket);
+
+      console.log(
+        `Authenticated user ${socket.username} disconnected from Node A. ` +
+        `Total: ${clients.size}`
+      );
+    }
   });
 
-  // Report browser connection errors.
+  // STEP 9: Report browser connection errors.
   socket.on('error', (error) => {
     console.error('Browser client error:', error.message);
   });
 });
+
 
 // Start the first connection attempt.
 connectToNodeB();

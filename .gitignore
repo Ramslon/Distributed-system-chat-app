@@ -9,6 +9,10 @@ yarn-error.log*
 .env.local
 .env.*.local
 
+chat.db
+chat.db-shm
+chat.db-wal
+
 # Logs
 *.log
 logs/

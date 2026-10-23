@@ -1,15 +1,68 @@
 
+
+require('dotenv').config();
+
 const WebSocket = require('ws');
 const crypto = require('crypto');
+const jwt = require('jsonwebtoken');
 
-// Port used by Server Node B.
+if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) {
+  throw new Error(
+    'JWT_SECRET is missing or too short. Check your .env file.'
+  );
+}
+
+if (
+  !process.env.INTERNAL_PEER_SECRET ||
+  process.env.INTERNAL_PEER_SECRET.length < 32
+) {
+  throw new Error(
+    'INTERNAL_PEER_SECRET is missing or too short. Check your .env file.'
+  );
+}
+
+function verifyAuthToken(token) {
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+
+    if (
+      typeof decoded.sub !== 'string' ||
+      typeof decoded.username !== 'string'
+    ) {
+      return null;
+    }
+
+    return {
+      id: decoded.sub,
+      username: decoded.username
+    };
+  } catch (error) {
+    return null;
+  }
+}
+
+function isValidPeerSecret(candidate) {
+  if (typeof candidate !== 'string') {
+    return false;
+  }
+
+  const expectedBuffer = Buffer.from(
+    process.env.INTERNAL_PEER_SECRET
+  );
+
+  const candidateBuffer = Buffer.from(candidate);
+
+  return (
+    candidateBuffer.length === expectedBuffer.length &&
+    crypto.timingSafeEqual(candidateBuffer, expectedBuffer)
+  );
+}
+
 const PORT = 8081;
-
-// Create a WebSocket server for Node B.
 const server = new WebSocket.Server({ port: PORT });
 
-// Store browser clients connected directly to Node B.
 const clients = new Set();
+
 
 
 // Track message IDs to prevent duplicate processing.
@@ -40,6 +93,8 @@ let peerSocket = null;
 
 // Stores messages waiting to be delivered to Node A.
 const pendingMessages = [];
+
+let peerAuthenticated = false;
 
 // Track messages sent to Node A that are awaiting ACKs.
 const awaitingAcks = new Set();
@@ -280,8 +335,12 @@ function sendAcknowledgement(peer, messageId) {
 function flushPendingMessages() {
   if (flushingQueue) return;
 
-  if (!peerSocket || peerSocket.readyState !== WebSocket.OPEN) {
-    return;
+  if (
+  !peerSocket ||
+  peerSocket.readyState !== WebSocket.OPEN ||
+  !peerAuthenticated
+  ) {
+  return;
   }
 
   if (pendingMessages.length === 0) return;
@@ -348,141 +407,271 @@ function flushPendingMessages() {
   });
 }
 
-// Listen for new connections to Node B.
+
 server.on('connection', (socket, request) => {
-  // Read the URL used to establish this connection.
   const requestUrl = new URL(
     request.url,
     `http://localhost:${PORT}`
   );
 
-  // Check whether this connection comes from Server Node A.
-  const isPeer = requestUrl.searchParams.get('peer') === 'A';
+  const isPeerCandidate =
+    requestUrl.searchParams.get('peer') === 'A';
 
-  // Handle a server-to-server connection separately.
-  if (isPeer) {
-    peerSocket = socket;
+  let authenticated = false;
+  let authTimeout = null;
 
-    console.log('Server Node A connected to Node B');
-
-    // Send messages that were queued while Node A was unavailable.
-    flushPendingMessages();
-
-    
-socket.on('message', (data) => {
-  try {
-    const packet = JSON.parse(data.toString());
-
-    // Handle an acknowledgement received from Node A.
-    if (
-      packet.type === 'ack' &&
-      typeof packet.id === 'string'
-    ) {
-      acknowledgeMessage(packet.id);
-      return;
+  function clearAuthenticationTimeout() {
+    if (authTimeout) {
+      clearTimeout(authTimeout);
+      authTimeout = null;
     }
-
-    // Handle a chat message received from Node A.
-    if (
-      packet.type === 'chat' &&
-      typeof packet.id === 'string' &&
-      typeof packet.text === 'string'
-    ) {
-      // Duplicate messages must still receive an ACK.
-      if (!rememberMessageId(packet.id)) {
-  console.log('Duplicate message ignored:', packet.id);
-  sendAcknowledgement(socket, packet.id);
-  return;
-}
-
-      // Deliver the new message to Node B's browser clients.
-      broadcastToClients(packet.text);
-
-      // Normally acknowledge the processed message.
-      sendAcknowledgement(socket, packet.id);
-    }
-  } catch (error) {
-    console.error(
-      'Invalid message received from Node A:',
-      error.message
-    );
   }
-});
 
-    socket.on('close', () => {
-  // Only clean up state if this is still the active peer.
-  if (peerSocket === socket) {
-    peerSocket = null;
+  // Handle server-to-server connections.
+  // The URL parameter identifies a peer candidate, but does NOT
+  // authenticate it. The shared secret must also be verified.
+  if (isPeerCandidate) {
+    let peerAuthenticatedLocally = false;
 
-    // Cancel all outstanding ACK timers.
-    for (const timer of ackTimers.values()) {
-      clearTimeout(timer);
-    }
+    socket.on('message', (data) => {
+      let packet;
 
-    ackTimers.clear();
-    awaitingAcks.clear();
-    retryCounts.clear();
-    flushingQueue = false;
-   }
+      try {
+        packet = JSON.parse(data.toString());
+      } catch (error) {
+        console.error(
+          'Invalid JSON received on peer connection:',
+          error.message
+        );
 
-  console.log('Connection from Server Node A closed');
-   });
+        socket.close(1008, 'Invalid peer message');
+        return;
+      }
 
-    // Log errors on the server-to-server connection.
-    socket.on('error', (error) => {
-      console.error('Node A connection error:', error.message);
+      // Require the first packet to authenticate Node A.
+      if (!peerAuthenticatedLocally) {
+        if (
+          packet.type !== 'peer_auth' ||
+          !isValidPeerSecret(packet.secret)
+        ) {
+          console.error(
+            'Rejected unauthenticated or invalid peer connection.'
+          );
+
+          socket.close(1008, 'Peer authentication failed');
+          return;
+        }
+
+        // Only one active peer connection is needed.
+        if (
+          peerSocket &&
+          peerSocket !== socket &&
+          peerSocket.readyState === WebSocket.OPEN
+        ) {
+          console.warn(
+            'Replacing the existing Node A peer connection.'
+          );
+
+          peerSocket.close(1000, 'Peer connection replaced');
+        }
+
+        peerAuthenticatedLocally = true;
+        peerAuthenticated = true;
+        peerSocket = socket;
+
+        socket.send(JSON.stringify({
+          type: 'peer_auth_success'
+        }));
+
+        console.log(
+          'Node A successfully authenticated with Node B.'
+        );
+
+        flushPendingMessages();
+        return;
+      }
+
+      // Ignore messages from a socket that is no longer the active peer.
+      if (
+        peerSocket !== socket ||
+        !peerAuthenticated
+      ) {
+        return;
+      }
+
+      // Preserve the existing acknowledgement system.
+      if (
+        packet.type === 'ack' &&
+        typeof packet.id === 'string'
+      ) {
+        acknowledgeMessage(packet.id);
+        return;
+      }
+
+      // Preserve duplicate detection and delivery acknowledgements.
+      if (
+        packet.type === 'chat' &&
+        typeof packet.id === 'string' &&
+        typeof packet.text === 'string'
+      ) {
+        if (!rememberMessageId(packet.id)) {
+          console.log(
+            'Duplicate message ignored:',
+            packet.id
+          );
+
+          sendAcknowledgement(socket, packet.id);
+          return;
+        }
+
+        broadcastToClients(packet.text);
+        sendAcknowledgement(socket, packet.id);
+      }
     });
 
-    // Do not treat Server Node A as a browser client.
+    socket.on('close', () => {
+      if (peerSocket === socket) {
+        peerSocket = null;
+        peerAuthenticated = false;
+
+        for (const timer of ackTimers.values()) {
+          clearTimeout(timer);
+        }
+
+        ackTimers.clear();
+        awaitingAcks.clear();
+        retryCounts.clear();
+        flushingQueue = false;
+      }
+
+      console.log('Connection from Server Node A closed.');
+    });
+
+    socket.on('error', (error) => {
+      console.error(
+        'Node A connection error:',
+        error.message
+      );
+    });
+
     return;
   }
 
-  // Register an ordinary browser client.
-  clients.add(socket);
-
-  console.log(`Client connected to Node B. Total: ${clients.size}`);
+  // All non-peer connections are browser clients.
+  // They must authenticate with a valid JWT before joining clients.
+  authTimeout = setTimeout(() => {
+    if (!authenticated) {
+      socket.close(1008, 'Authentication timeout');
+    }
+  }, 5000);
 
   socket.on('message', (data) => {
-  const message = data.toString();
-  
+    const rawMessage = data.toString();
 
-  console.log(`Node B received: ${message}`);
-  
-  // Generate a unique ID for this browser message.
-  const messageId = crypto.randomUUID();
+    if (!authenticated) {
+      let packet;
 
-  // Remember the ID before broadcasting locally.
-  rememberMessageId(messageId);
+      try {
+        packet = JSON.parse(rawMessage);
+      } catch (error) {
+        socket.close(1008, 'Authentication required');
+        return;
+      }
 
-  // Create a structured packet for Node A.
-  const packet = JSON.stringify({
-    type: 'chat',
-    id: messageId,
-    text: message
+      if (
+        packet.type !== 'auth' ||
+        typeof packet.token !== 'string'
+      ) {
+        socket.close(1008, 'Authentication required');
+        return;
+      }
+
+      const user = verifyAuthToken(packet.token);
+
+      if (!user) {
+        clearAuthenticationTimeout();
+
+        console.warn(
+          'Rejected browser client with an invalid JWT.'
+        );
+
+        socket.close(1008, 'Invalid authentication token');
+        return;
+      }
+
+      authenticated = true;
+      socket.userId = user.id;
+      socket.username = user.username;
+
+      clearAuthenticationTimeout();
+      clients.add(socket);
+
+      socket.send(JSON.stringify({
+        type: 'auth_success',
+        user: {
+          id: user.id,
+          username: user.username
+        }
+      }));
+
+      console.log(
+        `Authenticated client connected to Node B. Total: ${clients.size}`
+      );
+
+      return;
+    }
+
+    // Only authenticated clients may send chat messages.
+    const userMessage = rawMessage.trim();
+
+    if (!userMessage) {
+      return;
+    }
+
+    // Use the authenticated username, not a client-supplied identity.
+    const message = `${socket.username}: ${userMessage}`;
+    const messageId = crypto.randomUUID();
+
+    rememberMessageId(messageId);
+
+    const packet = JSON.stringify({
+      type: 'chat',
+      id: messageId,
+      text: message
+    });
+
+    // Preserve immediate local broadcast and queued peer delivery.
+    broadcastToClients(message);
+
+    const queued = sendToPeer(packet);
+
+    if (
+      !queued &&
+      socket.readyState === WebSocket.OPEN
+    ) {
+      socket.send(
+        'System: Message was not queued because the pending queue is full. Please try again later.'
+      );
+    }
   });
 
-  // Preserve the current local chat behavior.
-  broadcastToClients(message);
-
-  // Queue the message for delivery to the peer.
-const queued = sendToPeer(packet);
-
-// Inform the sender if the queue is full.
-if (!queued && socket.readyState === WebSocket.OPEN) {
-  socket.send(
-    'System: Message was not queued because the pending queue is full. Please try again later.'
-  );
-}
-   });
-  // Remove a browser client when it disconnects.
   socket.on('close', () => {
-    clients.delete(socket);
+    clearAuthenticationTimeout();
 
-    console.log(`Client disconnected from Node B. Total: ${clients.size}`);
+    if (authenticated) {
+      clients.delete(socket);
+
+      console.log(
+        `Client disconnected from Node B. Total: ${clients.size}`
+      );
+    }
   });
 
-  // Report errors on individual browser connections.
   socket.on('error', (error) => {
-    console.error('Browser client error:', error.message);
+    console.error(
+      'Node B client connection error:',
+      error.message
+    );
   });
 });
+
