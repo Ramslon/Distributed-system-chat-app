@@ -2,17 +2,15 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <!-- Defines the character encoding used by the page. -->
   <meta charset="UTF-8">
-
-  <!-- Makes the page display correctly on phones and desktops. -->
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-
-  <!-- The title shown in the browser tab. -->
   <title>Distributed Chat</title>
 
   <style>
-    /* Styles the entire page. */
+    * {
+      box-sizing: border-box;
+    }
+
     body {
       font-family: Arial, sans-serif;
       max-width: 700px;
@@ -22,7 +20,6 @@
       color: #222;
     }
 
-    /* Styles the main chat panel. */
     .chat-container {
       background: white;
       padding: 24px;
@@ -30,9 +27,23 @@
       box-shadow: 0 4px 14px rgba(0, 0, 0, 0.08);
     }
 
-    /* Gives each input a consistent layout. */
+    h1 {
+      margin-top: 0;
+      color: #34205f;
+    }
+
+    h2 {
+      font-size: 20px;
+      margin-top: 10px;
+    }
+
+    label {
+      display: block;
+      margin-top: 12px;
+      font-weight: bold;
+    }
+
     input {
-      box-sizing: border-box;
       padding: 12px;
       margin: 6px 0;
       width: 100%;
@@ -41,7 +52,6 @@
       font-size: 16px;
     }
 
-    /* Styles the Send button. */
     button {
       padding: 12px 20px;
       margin-top: 8px;
@@ -50,21 +60,41 @@
       border: none;
       border-radius: 6px;
       cursor: pointer;
-      font-size: 16px;
+      font-size: 15px;
     }
 
-    /* Changes the button appearance when hovered over. */
     button:hover {
       background: #3e2a9b;
     }
 
-    /* Displays the connection status. */
+    button:disabled {
+      background: #999;
+      cursor: not-allowed;
+    }
+
+    .secondary-button {
+      background: #e9e5f8;
+      color: #34205f;
+    }
+
+    .secondary-button:hover {
+      background: #d9d1f3;
+    }
+
+    .hidden {
+      display: none !important;
+    }
+
     #status {
       margin: 12px 0;
       font-weight: bold;
     }
 
-    /* Creates a scrollable area for chat messages. */
+    #authStatus {
+      margin-top: 12px;
+      overflow-wrap: anywhere;
+    }
+
     #chat {
       height: 280px;
       overflow-y: auto;
@@ -76,7 +106,6 @@
       overflow-wrap: anywhere;
     }
 
-    /* Styles individual messages and system notifications. */
     .message {
       padding: 8px;
       margin: 6px 0;
@@ -88,240 +117,612 @@
       color: #555;
       font-style: italic;
     }
+
+    .error-message {
+      color: #b42318;
+    }
+
+    .success-message {
+      color: #16803c;
+    }
+
+    .auth-section {
+      border-bottom: 1px solid #eee;
+      padding-bottom: 20px;
+      margin-bottom: 20px;
+    }
+
+    .button-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    #messageForm {
+      margin-top: 18px;
+    }
   </style>
 </head>
 
 <body>
   <div class="chat-container">
-    <!-- Main heading displayed above the chat. -->
     <h1>Distributed Chat</h1>
 
-    <!-- Lets the user choose a display name. -->
-    <label for="username">Your username</label>
-    <input
-      id="username"
-      type="text"
-      placeholder="Enter your username"
-      maxlength="20"
-    >
+    <!-- Login and registration -->
+    <section id="authSection" class="auth-section">
+      <div class="button-row">
+        <button id="showLoginButton" type="button">
+          Login
+        </button>
 
-    <!-- Shows whether the WebSocket connection is ready. -->
-    <p id="status">Connecting to server...</p>
+        <button
+          id="showRegisterButton"
+          type="button"
+          class="secondary-button"
+        >
+          Create Account
+        </button>
+      </div>
 
-    <!-- Input where the user writes a message. -->
-    <label for="msg">Your message</label>
-    <input
-      id="msg"
-      type="text"
-      placeholder="Type a message..."
-      maxlength="500"
-    >
+      <!-- Login form -->
+      <form id="loginForm">
+        <h2>Welcome Back</h2>
 
-    <!-- Clicking this button calls the sendMessage function. -->
-    <button id="sendButton" type="button">Send</button>
+        <label for="loginEmail">Email</label>
+        <input
+          id="loginEmail"
+          type="email"
+          autocomplete="email"
+          placeholder="Enter your email"
+          required
+        >
 
-    <!-- Messages and connection notifications appear here. -->
-    <div id="chat" aria-live="polite"></div>
+        <label for="loginPassword">Password</label>
+        <input
+          id="loginPassword"
+          type="password"
+          autocomplete="current-password"
+          placeholder="Enter your password"
+          required
+        >
+
+        <button id="loginButton" type="submit">
+          Login
+        </button>
+      </form>
+
+      <!-- Registration form -->
+      <form id="registerForm" class="hidden">
+        <h2>Create Your Account</h2>
+
+        <label for="registerUsername">Username</label>
+        <input
+          id="registerUsername"
+          type="text"
+          autocomplete="username"
+          maxlength="20"
+          placeholder="Choose a username"
+          required
+        >
+
+        <label for="registerEmail">Email</label>
+        <input
+          id="registerEmail"
+          type="email"
+          autocomplete="email"
+          placeholder="Enter your email"
+          required
+        >
+
+        <label for="registerPassword">Password</label>
+        <input
+          id="registerPassword"
+          type="password"
+          autocomplete="new-password"
+          minlength="8"
+          placeholder="Create a password"
+          required
+        >
+
+        <button id="registerButton" type="submit">
+          Register
+        </button>
+      </form>
+
+      <p id="authStatus" aria-live="polite"></p>
+    </section>
+
+    <!-- Authenticated user information -->
+    <section id="userSection" class="hidden">
+      <p>
+        Logged in as <strong id="currentUsername"></strong>
+      </p>
+
+      <button id="logoutButton" type="button">
+        Logout
+      </button>
+    </section>
+
+    <p id="status" aria-live="polite">
+      Please log in to connect to the chat.
+    </p>
+
+    <!-- Chat interface -->
+    <section id="chatSection" class="hidden">
+      <form id="messageForm">
+        <label for="msg">Your message</label>
+
+        <input
+          id="msg"
+          type="text"
+          placeholder="Type a message..."
+          maxlength="500"
+          autocomplete="off"
+        >
+
+        <button id="sendButton" type="submit" disabled>
+          Send
+        </button>
+      </form>
+
+      <div id="chat" aria-live="polite"></div>
+    </section>
   </div>
 
-  
-<script>
-  // Address of Node A's WebSocket server.
-  const SERVER_URL = 'ws://localhost:8080';
+  <script>
+    // Node A WebSocket server.
+    const SERVER_URL = 'ws://localhost:8090';
 
-  // Find the HTML elements used by the chat.
-  const usernameInput = document.getElementById('username');
-  const messageInput = document.getElementById('msg');
-  const sendButton = document.getElementById('sendButton');
-  const status = document.getElementById('status');
-  const chat = document.getElementById('chat');
+    // Authentication API.
+    const AUTH_API_URL = 'http://localhost:3000/api';
 
-  // Use let because the WebSocket will be replaced after disconnection.
-  let socket = null;
+    // HTML elements.
+    const authSection = document.getElementById('authSection');
+    const loginForm = document.getElementById('loginForm');
+    const registerForm = document.getElementById('registerForm');
 
-  // Stores the pending reconnection timer.
-  let reconnectTimer = null;
+    const showLoginButton =
+      document.getElementById('showLoginButton');
 
-  // Wait two seconds before attempting to reconnect.
-  const RECONNECT_DELAY = 2000;
+    const showRegisterButton =
+      document.getElementById('showRegisterButton');
 
-  // Prevent duplicate reconnection timers.
-  let reconnecting = false;
+    const loginButton = document.getElementById('loginButton');
+    const registerButton = document.getElementById('registerButton');
 
-  // Safely display a message in the chat area.
-  function displayMessage(text, isSystemMessage = false) {
-    const paragraph = document.createElement('p');
+    const loginEmail = document.getElementById('loginEmail');
+    const loginPassword = document.getElementById('loginPassword');
 
-    paragraph.className = isSystemMessage
-      ? 'system-message'
-      : 'message';
+    const registerUsername =
+      document.getElementById('registerUsername');
 
-    // Display the message as plain text, not HTML.
-    paragraph.textContent = text;
+    const registerEmail =
+      document.getElementById('registerEmail');
 
-    chat.appendChild(paragraph);
+    const registerPassword =
+      document.getElementById('registerPassword');
 
-    // Scroll down to the latest message.
-    chat.scrollTop = chat.scrollHeight;
-  }
+    const authStatus = document.getElementById('authStatus');
+    const userSection = document.getElementById('userSection');
+    const currentUsername =
+      document.getElementById('currentUsername');
 
-  // Connect the browser to Node A.
-  function connectToServer() {
-    // Do not create another connection if one is already active.
-    if (
-      socket &&
-      (socket.readyState === WebSocket.CONNECTING ||
-       socket.readyState === WebSocket.OPEN)
-    ) {
-      return;
+    const logoutButton = document.getElementById('logoutButton');
+    const chatSection = document.getElementById('chatSection');
+    const messageForm = document.getElementById('messageForm');
+    const messageInput = document.getElementById('msg');
+    const sendButton = document.getElementById('sendButton');
+    const status = document.getElementById('status');
+    const chat = document.getElementById('chat');
+
+    // WebSocket state.
+    let socket = null;
+    let reconnectTimer = null;
+    let reconnecting = false;
+    let isAuthenticated = false;
+
+    const RECONNECT_DELAY = 2000;
+
+    // The username is obtained from the authenticated server response.
+    let authenticatedUsername = '';
+
+    function getToken() {
+      return sessionStorage.getItem('chatToken');
     }
 
-    reconnecting = false;
+    function displayMessage(text, isSystemMessage = false) {
+      const paragraph = document.createElement('p');
 
-    status.textContent = 'Connecting to server...';
-    status.style.color = '';
+      paragraph.className = isSystemMessage
+        ? 'system-message'
+        : 'message';
 
-    // Disable sending until the connection is established.
-    sendButton.disabled = true;
+      // Display plain text rather than interpreting HTML.
+      paragraph.textContent = String(text);
 
-    // Create a fresh WebSocket connection to Node A.
-    const newSocket = new WebSocket(SERVER_URL);
+      chat.appendChild(paragraph);
+      chat.scrollTop = chat.scrollHeight;
+    }
 
-    // Save the new connection for message sending.
-    socket = newSocket;
+    function setAuthStatus(message, type = '') {
+      authStatus.textContent = message;
+      authStatus.className = type;
+    }
 
-    // Runs when the connection succeeds.
-    newSocket.addEventListener('open', () => {
-      // Ignore events from an old connection.
-      if (socket !== newSocket) return;
+    function showLogin() {
+      loginForm.classList.remove('hidden');
+      registerForm.classList.add('hidden');
+      setAuthStatus('');
+    }
 
-      status.textContent = 'Connected to server';
-      status.style.color = 'green';
+    function showRegistration() {
+      registerForm.classList.remove('hidden');
+      loginForm.classList.add('hidden');
+      setAuthStatus('');
+    }
 
-      sendButton.disabled = false;
+    showLoginButton.addEventListener('click', showLogin);
+    showRegisterButton.addEventListener(
+      'click',
+      showRegistration
+    );
 
-      displayMessage('Connected to the chat server.', true);
+    async function postAuthRequest(endpoint, payload) {
+      const response = await fetch(
+        `${AUTH_API_URL}/${endpoint}`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify(payload)
+        }
+      );
 
-      // Cancel any outstanding reconnect timer.
+      const data = await response.json().catch(() => ({}));
+
+      if (!response.ok) {
+        throw new Error(
+          data.message ||
+          data.error ||
+          `Request failed with status ${response.status}`
+        );
+      }
+
+      return data;
+    }
+
+    function saveLogin(data) {
+      // Support the token field returned by the authentication API.
+      const token = data.token || data.access_token;
+
+      if (typeof token !== 'string' || token.length === 0) {
+        throw new Error(
+          'The API did not return a JWT token. Check authServer.js.'
+        );
+      }
+
+      sessionStorage.setItem('chatToken', token);
+
+      authenticatedUsername =
+        data.user?.username ||
+        data.username ||
+        '';
+
+      authSection.classList.add('hidden');
+      userSection.classList.remove('hidden');
+      chatSection.classList.remove('hidden');
+
+      currentUsername.textContent =
+        authenticatedUsername || 'Authenticated user';
+
+      setAuthStatus('');
+      isAuthenticated = false;
+
+      connectToServer();
+    }
+
+    // Login with an existing account.
+    loginForm.addEventListener('submit', async (event) => {
+      event.preventDefault();
+
+      loginButton.disabled = true;
+      setAuthStatus('Logging in...');
+
+      try {
+        const data = await postAuthRequest('login', {
+          email: loginEmail.value.trim(),
+          password: loginPassword.value
+        });
+
+        saveLogin(data);
+      } catch (error) {
+        setAuthStatus(error.message, 'error-message');
+      } finally {
+        loginButton.disabled = false;
+      }
+    });
+
+    // Register a new account, then log in if registration
+    // does not itself return a JWT.
+    registerForm.addEventListener('submit', async (event) => {
+      event.preventDefault();
+
+      registerButton.disabled = true;
+      setAuthStatus('Creating your account...');
+
+      const username = registerUsername.value.trim();
+      const email = registerEmail.value.trim();
+      const password = registerPassword.value;
+
+      try {
+        let data = await postAuthRequest('register', {
+          username,
+          email,
+          password
+        });
+
+        const token = data.token || data.access_token;
+
+        if (typeof token === 'string' && token.length > 0) {
+          saveLogin(data);
+        } else {
+          // Some APIs register users but require a separate login.
+          setAuthStatus(
+            'Account created. Logging you in...',
+            'success-message'
+          );
+
+          data = await postAuthRequest('login', {
+            email,
+            password
+          });
+
+          saveLogin(data);
+        }
+
+        registerPassword.value = '';
+      } catch (error) {
+        setAuthStatus(error.message, 'error-message');
+      } finally {
+        registerButton.disabled = false;
+      }
+    });
+
+    function connectToServer() {
+      const token = getToken();
+
+      if (!token) {
+        return;
+      }
+
+      if (
+        socket &&
+        (socket.readyState === WebSocket.CONNECTING ||
+         socket.readyState === WebSocket.OPEN)
+      ) {
+        return;
+      }
+
+      reconnecting = false;
+      isAuthenticated = false;
+
+      status.textContent = 'Connecting and authenticating...';
+      status.style.color = '#a66b00';
+      sendButton.disabled = true;
+
+      const newSocket = new WebSocket(SERVER_URL);
+      socket = newSocket;
+
+      newSocket.addEventListener('open', () => {
+        if (socket !== newSocket) return;
+
+        // Authenticate immediately after opening the connection.
+        newSocket.send(JSON.stringify({
+          type: 'auth',
+          token
+        }));
+
+        status.textContent = 'Authenticating with Node A...';
+        status.style.color = '#a66b00';
+
+        if (reconnectTimer !== null) {
+          clearTimeout(reconnectTimer);
+          reconnectTimer = null;
+        }
+
+        reconnecting = false;
+      });
+
+      newSocket.addEventListener('message', (event) => {
+        if (socket !== newSocket) return;
+
+        const received = String(event.data);
+
+        // The server sends JSON for authentication success,
+        // but regular chat messages remain plain text.
+        try {
+          const packet = JSON.parse(received);
+
+          if (packet.type === 'auth_success') {
+            isAuthenticated = true;
+
+            authenticatedUsername =
+              packet.user?.username ||
+              authenticatedUsername;
+
+            currentUsername.textContent =
+              authenticatedUsername || 'Authenticated user';
+
+            status.textContent = 'Authenticated and connected to Node A';
+            status.style.color = 'green';
+
+            sendButton.disabled = false;
+
+            displayMessage(
+              'Successfully authenticated with the chat server.',
+              true
+            );
+
+            return;
+          }
+
+          if (packet.type === 'auth_error') {
+            displayMessage(
+              packet.message || 'Authentication failed.',
+              true
+            );
+            return;
+          }
+        } catch (error) {
+          // This is a normal text chat message, not a JSON packet.
+        }
+
+        displayMessage(received);
+      });
+
+      newSocket.addEventListener('close', (event) => {
+        if (socket !== newSocket) return;
+
+        isAuthenticated = false;
+        sendButton.disabled = true;
+
+        if (event.code === 1008) {
+          // A policy close commonly means the token was rejected.
+          sessionStorage.removeItem('chatToken');
+
+          status.textContent =
+            'Authentication rejected. Please log in again.';
+          status.style.color = 'red';
+
+          authSection.classList.remove('hidden');
+          userSection.classList.add('hidden');
+          chatSection.classList.add('hidden');
+
+          displayMessage(
+            'The server rejected authentication. Please log in again.',
+            true
+          );
+
+          showLogin();
+          return;
+        }
+
+        status.textContent = 'Disconnected. Reconnecting...';
+        status.style.color = 'red';
+
+        displayMessage(
+          'Connection closed. Trying to reconnect...',
+          true
+        );
+
+        if (getToken()) {
+          scheduleReconnect();
+        }
+      });
+
+      newSocket.addEventListener('error', (error) => {
+        console.error('WebSocket connection error:', error);
+
+        status.textContent = 'Connection error.';
+        status.style.color = 'red';
+      });
+    }
+
+    function scheduleReconnect() {
+      if (reconnecting || reconnectTimer !== null || !getToken()) {
+        return;
+      }
+
+      reconnecting = true;
+
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        reconnecting = false;
+        connectToServer();
+      }, RECONNECT_DELAY);
+    }
+
+    function sendMessage(event) {
+      event.preventDefault();
+
+      const message = messageInput.value.trim();
+
+      if (!message) {
+        return;
+      }
+
+      if (
+        !socket ||
+        socket.readyState !== WebSocket.OPEN ||
+        !isAuthenticated
+      ) {
+        displayMessage(
+          'Cannot send: please wait for authentication.',
+          true
+        );
+        return;
+      }
+
+      // Send only the message text. Node A adds the verified username.
+      socket.send(message);
+
+      messageInput.value = '';
+      messageInput.focus();
+    }
+
+    messageForm.addEventListener('submit', sendMessage);
+
+    logoutButton.addEventListener('click', () => {
+      // Remove the token before closing so reconnect is not scheduled.
+      sessionStorage.removeItem('chatToken');
+
+      isAuthenticated = false;
+      authenticatedUsername = '';
+      sendButton.disabled = true;
+
       if (reconnectTimer !== null) {
         clearTimeout(reconnectTimer);
         reconnectTimer = null;
       }
 
       reconnecting = false;
+
+      if (
+        socket &&
+        socket.readyState !== WebSocket.CLOSED
+      ) {
+        const oldSocket = socket;
+        socket = null;
+        oldSocket.close(1000, 'User logged out');
+      }
+
+      authSection.classList.remove('hidden');
+      userSection.classList.add('hidden');
+      chatSection.classList.add('hidden');
+
+      status.textContent = 'Logged out. Please log in to reconnect.';
+      status.style.color = '';
+
+      loginPassword.value = '';
+      registerPassword.value = '';
+
+      showLogin();
     });
 
-    // Runs when Node A sends a message to this browser.
-    newSocket.addEventListener('message', (event) => {
-      if (socket !== newSocket) return;
+    sendButton.disabled = true;
 
-      displayMessage(event.data);
-    });
+    // Restore the session after a page refresh if a token exists.
+    if (getToken()) {
+      authSection.classList.add('hidden');
+      userSection.classList.remove('hidden');
+      chatSection.classList.remove('hidden');
 
-    // Runs when the WebSocket connection closes.
-    newSocket.addEventListener('close', () => {
-      // Ignore close events from an older connection.
-      if (socket !== newSocket) return;
-
-      status.textContent = 'Disconnected. Reconnecting...';
-      status.style.color = 'red';
-
-      sendButton.disabled = true;
-
-      displayMessage(
-        'Connection closed. Trying to reconnect...',
-        true
-      );
-
-      scheduleReconnect();
-    });
-
-    // Runs when a connection error occurs.
-    newSocket.addEventListener('error', (error) => {
-      console.error('WebSocket connection error:', error);
-
-      status.textContent = 'Connection error. Reconnecting...';
-      status.style.color = 'red';
-
-      // The close event normally follows and schedules a retry.
-    });
-  }
-
-  // Schedule one reconnection attempt.
-  function scheduleReconnect() {
-    if (reconnecting || reconnectTimer !== null) {
-      return;
-    }
-
-    reconnecting = true;
-
-    reconnectTimer = setTimeout(() => {
-      reconnectTimer = null;
-      reconnecting = false;
-
-      // Try to establish a new connection.
+      status.textContent = 'Restoring your session...';
       connectToServer();
-    }, RECONNECT_DELAY);
-  }
-
-  // Send a message to Node A.
-  function sendMessage() {
-    const username = usernameInput.value.trim();
-    const message = messageInput.value.trim();
-
-    // Require a username.
-    if (username === '') {
-      displayMessage('Please enter a username first.', true);
-      usernameInput.focus();
-      return;
-    }
-
-    // Ignore empty messages.
-    if (message === '') {
-      return;
-    }
-
-    // Confirm that the current WebSocket is open.
-    if (!socket || socket.readyState !== WebSocket.OPEN) {
-      displayMessage(
-        'Cannot send: waiting for server connection.',
-        true
-      );
-      return;
-    }
-
-    
-    // Send commands without adding the username.
-    // Send ordinary chat messages with the username.
-    if (message.startsWith('/')) {
-      socket.send(message);
     } else {
-      const fullMessage = username + ': ' + message;
-      socket.send(fullMessage);
+      showLogin();
     }
-
-
-    // Clear the message field after sending.
-    messageInput.value = '';
-    messageInput.focus();
-  }
-
-  // Send messages when the Send button is clicked.
-  sendButton.addEventListener('click', sendMessage);
-
-  // Allow Enter to send a message.
-  messageInput.addEventListener('keydown', (event) => {
-    if (event.key === 'Enter') {
-      event.preventDefault();
-      sendMessage();
-    }
-  });
-
-  // Keep sending disabled until Node A is connected.
-  sendButton.disabled = true;
-
-  // Establish the first connection.
-  connectToServer();
-</script>
+  </script>
 </body>
 </html>
