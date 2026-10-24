@@ -46,11 +46,16 @@ if (
   );
 }
 
-// Port used by Server Node A.
-const PORT = 8090;
+// Render supplies PORT in production.
+// Local development continues to use NODE_A_PORT or 8090.
+const PORT =
+  Number(process.env.PORT || process.env.NODE_A_PORT) || 8090;
 
-// Address of Server Node B.
-const NODE_B_URL = 'ws://localhost:8081/?peer=A';
+// The peer URL remains configurable.
+// Locally, Node A connects to Node B on port 8081.
+const NODE_B_URL =
+  process.env.NODE_B_URL ||
+  'ws://localhost:8081/?peer=A';
 
 // Create the WebSocket server for browser clients.
 const server = new WebSocket.Server({ port: PORT });

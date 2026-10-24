@@ -58,7 +58,11 @@ function isValidPeerSecret(candidate) {
   );
 }
 
-const PORT = 8081;
+// Render supplies PORT in production.
+// Locally, Node B continues to use port 8081.
+const PORT =
+  Number(process.env.PORT || process.env.NODE_B_PORT) || 8081;
+
 const server = new WebSocket.Server({ port: PORT });
 
 const clients = new Set();

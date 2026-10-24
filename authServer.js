@@ -14,7 +14,9 @@ if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) {
   );
 }
 
-const PORT = Number(process.env.PORT) || 3000;
+// Prefer Render's assigned port; use AUTH_PORT locally.
+const PORT = Number(process.env.PORT || process.env.AUTH_PORT) || 3000;
+
 const TOKEN_EXPIRY = process.env.JWT_EXPIRES_IN || '1h';
 
 // 2. Create the Express application.
@@ -58,8 +60,11 @@ app.use((req, res, next) => {
 // Accept JSON request bodies up to 10 KB.
 app.use(express.json({ limit: '10kb' }));
 
-// 3. Open the SQLite database file in the project directory.
-const dbPath = path.join(__dirname, 'chat.db');
+// Local development uses chat.db in the project directory.
+// Production can point to a persistent disk using DB_PATH.
+const dbPath =
+  process.env.DB_PATH || path.join(__dirname, 'chat.db');
+
 const db = new sqlite3.Database(dbPath);
 
 // 4. Create the users table if it doesn't already exist.
@@ -82,8 +87,8 @@ db.run(
     console.log('Users table is ready.');
 
     // Start the API only after the database is ready.
-    app.listen(PORT, '127.0.0.1', () => {
-      console.log(`Authentication API running on http://127.0.0.1:${PORT}`);
+    app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Authentication API listening on port ${PORT}`);
     });
   }
 );
