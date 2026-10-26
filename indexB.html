@@ -261,11 +261,11 @@
   </div>
 
   <script>
-    // Node B WebSocket server.
-    const SERVER_URL = 'ws://localhost:8081';
+    // Production Node B WebSocket server.
+    const SERVER_URL = 'wss://chat-node-b.onrender.com';
 
-    // Shared authentication API.
-    const AUTH_API_URL = 'http://localhost:3000/api';
+    // Shared production authentication API.
+    const AUTH_API_URL = 'https://chat-auth-api.onrender.com/api';
 
     const authSection = document.getElementById('authSection');
     const loginForm = document.getElementById('loginForm');
