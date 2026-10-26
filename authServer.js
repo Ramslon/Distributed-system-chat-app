@@ -24,6 +24,9 @@ if (!process.env.DATABASE_URL) {
 const PORT = Number(process.env.PORT || process.env.AUTH_PORT) || 3000;
 const TOKEN_EXPIRY = process.env.JWT_EXPIRES_IN || '1h';
 
+const DUMMY_PASSWORD_HASH =
+  '$2b$12$kG//rw1DHCoNIR3X8DdnjOqFmGZb5UYSlKRH3daQqXAkEvZ/jVeMG';
+
 // 2. Create the Express application.
 const app = express();
 
@@ -226,19 +229,18 @@ app.post('/api/login', loginLimiter, async (req, res) => {
 
     const user = result.rows[0];
 
-    // Use the same response for unknown emails and wrong passwords.
-    if (!user) {
-      return res.status(401).json({
-        error: 'Invalid email or password.'
-      });
-    }
+    // Always perform a bcrypt comparison, even when the email is unknown.
+    const passwordHash = user
+      ? user.password_hash
+      : DUMMY_PASSWORD_HASH;
 
     const matches = await bcrypt.compare(
       password,
-      user.password_hash
+      passwordHash
     );
 
-    if (!matches) {
+    // Return the same response for unknown emails and wrong passwords.
+    if (!user || !matches) {
       return res.status(401).json({
         error: 'Invalid email or password.'
       });
