@@ -6,6 +6,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { Pool } = require('pg');
 const helmet = require('helmet');
+const { rateLimit } = require('express-rate-limit');
 
 // 1. Validate configuration.
 if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) {
@@ -25,6 +26,27 @@ const TOKEN_EXPIRY = process.env.JWT_EXPIRES_IN || '1h';
 
 // 2. Create the Express application.
 const app = express();
+
+// Rate-limit repeated authentication requests.
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  limit: 10,                 // Maximum 10 requests per window
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  message: {
+    error: 'Too many login attempts. Please try again in 15 minutes.',
+  },
+});
+
+const registerLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  limit: 5,                 // Maximum 5 registration requests per window
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  message: {
+    error: 'Too many registration attempts. Please try again later.',
+  },
+});
 
 // Apply HTTP security headers.
 app.use(helmet());
@@ -97,7 +119,7 @@ app.get('/api/health', async (req, res) => {
 });
 
 // 6. Register a new user.
-app.post('/api/register', async (req, res) => {
+app.post('/api/register', registerLimiter, async (req, res) => {
   try {
     const { username, email, password } = req.body || {};
 
@@ -178,7 +200,7 @@ app.post('/api/register', async (req, res) => {
 });
 
 // 7. Log in with an email address and password.
-app.post('/api/login', async (req, res) => {
+app.post('/api/login', loginLimiter, async (req, res) => {
   try {
     const { email, password } = req.body || {};
 
