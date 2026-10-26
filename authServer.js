@@ -45,37 +45,30 @@ pool.on('error', (error) => {
 });
 
 // 4. Configure CORS for local frontend development.
-const allowedOrigins = new Set([
+
+const cors = require('cors');
+
+const allowedOrigins = [
   'http://localhost:5500',
   'http://127.0.0.1:5500',
   'http://localhost:5501',
-  'http://127.0.0.1:5501'
-]);
+  'http://127.0.0.1:5501',
+  'https://distributed-system-chat-app.vercel.app',
+];
 
-app.use((req, res, next) => {
-  const origin = req.headers.origin;
+app.use(cors({
+  origin: function (origin, callback) {
+    // Permit requests without an Origin header, such as
+    // trusted server-to-server or command-line requests.
+    if (!origin || allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
 
-  if (origin && allowedOrigins.has(origin)) {
-    res.setHeader('Access-Control-Allow-Origin', origin);
-    res.setHeader('Vary', 'Origin');
-  }
-
-  res.setHeader(
-    'Access-Control-Allow-Methods',
-    'GET, POST, OPTIONS'
-  );
-
-  res.setHeader(
-    'Access-Control-Allow-Headers',
-    'Content-Type, Authorization'
-  );
-
-  if (req.method === 'OPTIONS') {
-    return res.sendStatus(204);
-  }
-
-  next();
-});
+    return callback(new Error('Origin not allowed by CORS'));
+  },
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+}));
 
 // Accept JSON request bodies up to 10 KB.
 app.use(express.json({ limit: '10kb' }));
