@@ -683,6 +683,7 @@
       background: var(--red);
     }
 
+    /* Keep the empty prompt visible until the first real chat message arrives. */
     .chat {
       display: flex;
       min-height: 250px;
@@ -740,6 +741,7 @@
       line-height: 1.8;
     }
 
+    /* Group the sender and local receipt time above each message body. */
     .message {
       display: flex;
       width: fit-content;
@@ -768,14 +770,33 @@
     }
 
     .message-sender {
-      color: #b9a8ff;
+      color: #cbbdff;
       font-size: 10px;
       font-weight: 750;
-      letter-spacing: 0.3px;
+      letter-spacing: 0.45px;
+      text-transform: uppercase;
     }
 
     .message.own .message-sender {
       color: #ded4ff;
+    }
+
+    .message-meta {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+    }
+
+    .message-time {
+      color: #8d8aa5;
+      font-size: 10px;
+      font-weight: 500;
+      white-space: nowrap;
+    }
+
+    .message.own .message-time {
+      color: #c0b4e9;
     }
 
     .system-message {
@@ -1381,6 +1402,7 @@
             <span class="conversation-tag">REAL-TIME</span>
           </div>
 
+          <!-- Keep the empty-state prompt until an actual chat message is received. -->
           <div id="chat" class="chat" role="log"
             aria-label="Chat messages" aria-live="polite"
             aria-relevant="additions text">
@@ -1495,11 +1517,8 @@
       sidebarNodeDot.classList.toggle('online', connected);
     }
 
+    // Render messages without changing the plain-text WebSocket protocol.
     function displayMessage(text, isSystemMessage = false) {
-      if (emptyState) {
-        emptyState.remove();
-      }
-
       const content = String(text);
 
       if (isSystemMessage) {
@@ -1511,8 +1530,16 @@
         return;
       }
 
+      if (emptyState) {
+        emptyState.remove();
+      }
+
+      // Chat packets contain no timestamp, so show the time this client received them.
+      const receivedAt = new Date();
       const message = document.createElement('div');
       message.className = 'message';
+      const messageMeta = document.createElement('div');
+      messageMeta.className = 'message-meta';
 
       // Existing servers deliver normal chat messages as plain text.
       // Match the authenticated username to distinguish our own messages.
@@ -1531,13 +1558,24 @@
         senderLabel.className = 'message-sender';
         senderLabel.textContent = isOwnMessage ? 'You' : sender;
 
-        message.appendChild(senderLabel);
+        messageMeta.appendChild(senderLabel);
         bodyText = body;
 
         if (isOwnMessage) {
           message.classList.add('own');
         }
       }
+
+      const timestamp = document.createElement('time');
+      timestamp.className = 'message-time';
+      timestamp.dateTime = receivedAt.toISOString();
+      timestamp.textContent = receivedAt.toLocaleTimeString([], {
+        hour: 'numeric',
+        minute: '2-digit'
+      });
+      timestamp.title = receivedAt.toLocaleString();
+      messageMeta.appendChild(timestamp);
+      message.appendChild(messageMeta);
 
       const bodyNode = document.createElement('span');
       bodyNode.textContent = bodyText;
