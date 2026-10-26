@@ -275,8 +275,17 @@ app.post('/api/login', loginLimiter, async (req, res) => {
   }
 });
 
-// 8. Handle malformed JSON and unexpected errors.
+
+/* 8. Handle malformed JSON, CORS rejections and unexpected errors. */
 app.use((error, req, res, next) => {
+  // Reject requests from origins not on the allowlist.
+  if (error.message === 'Origin not allowed by CORS') {
+    return res.status(403).json({
+      error: 'Origin not allowed.'
+    });
+  }
+
+  // Handle malformed JSON request bodies.
   if (
     error instanceof SyntaxError &&
     error.status === 400 &&
@@ -287,12 +296,14 @@ app.use((error, req, res, next) => {
     });
   }
 
+  // Log unexpected errors without exposing internal details.
   console.error('Unexpected API error:', error.message);
 
   return res.status(500).json({
     error: 'An unexpected server error occurred.'
   });
 });
+
 
 // 9. Create the table and start only after PostgreSQL is ready.
 async function startServer() {
