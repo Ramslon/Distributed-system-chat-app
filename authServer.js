@@ -5,6 +5,7 @@ const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { Pool } = require('pg');
+const helmet = require('helmet');
 
 // 1. Validate configuration.
 if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) {
@@ -24,6 +25,9 @@ const TOKEN_EXPIRY = process.env.JWT_EXPIRES_IN || '1h';
 
 // 2. Create the Express application.
 const app = express();
+
+// Apply HTTP security headers.
+app.use(helmet());
 
 // 3. Configure PostgreSQL.
 // Use Neon's connection string and encrypted connection.
