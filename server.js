@@ -4,6 +4,7 @@ require('dotenv').config();
 const WebSocket = require('ws');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
+const messageStore = require('./messageStore');
 
 // The API and Node A must use the same JWT secret.
 if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) {
@@ -134,35 +135,30 @@ const MAX_PENDING_MESSAGES = 1000;
 // Prevent multiple queued messages from being flushed simultaneously.
 let flushingQueue = false;
 
+// Prevent overlapping PostgreSQL recovery operations.
+let recoveringDeliveries = false;
+
+// Retry database-backed delivery work without duplicate timers.
+let databaseRetryTimer = null;
 
 /**
- * Recover previously failed messages after Node B reconnects.
- * Original message IDs are preserved to prevent duplicate delivery.
+ * Explicitly recover failed messages using their persisted delivery state.
+ * Original IDs are preserved, and failed entries remain in memory if
+ * PostgreSQL cannot confirm their recovery.
  */
-function recoverFailedMessages() {
-  if (failedMessages.size === 0) {
-    return;
-  }
-
-  const availableSlots =
-    MAX_PENDING_MESSAGES - pendingMessages.length;
-
-  if (availableSlots <= 0) {
-    console.warn(
-      'Cannot recover failed messages: pending queue is full.'
-    );
-    return;
-  }
-
+async function recoverFailedMessages() {
   const recoveredPackets = [];
 
   for (const [messageId, packet] of failedMessages) {
-    // Do not exceed the pending queue limit.
-    if (recoveredPackets.length >= availableSlots) {
+    if (pendingMessages.length + recoveredPackets.length >=
+        MAX_PENDING_MESSAGES) {
+      console.warn(
+        'Cannot recover more failed messages: pending queue is full.'
+      );
       break;
     }
 
-    // Check whether this message is already queued.
+    // Ensure this packet is not already waiting in the queue.
     const alreadyQueued = pendingMessages.some((queuedPacket) => {
       try {
         return JSON.parse(queuedPacket).id === messageId;
@@ -172,18 +168,59 @@ function recoverFailedMessages() {
     });
 
     if (alreadyQueued) {
-      // Remove the redundant failed entry.
       failedMessages.delete(messageId);
       continue;
     }
 
-    // Recover the original packet without generating a new ID.
-    recoveredPackets.push(packet);
-    failedMessages.delete(messageId);
+    try {
+      const recovered = await messageStore.recoverFailedDelivery(
+        messageId,
+        'B'
+      );
+
+
+           if (!recovered) {
+        const status = await messageStore.getDeliveryStatus(
+          messageId,
+          'B'
+        );
+
+        if (status === 'acknowledged') {
+          failedMessages.delete(messageId);
+          retryCounts.delete(messageId);
+
+          console.log(
+            `Message ${messageId} was already acknowledged.`
+          );
+        } else if (status === 'pending') {
+          // The database is already ready for delivery.
+          recoveredPackets.push(packet);
+          failedMessages.delete(messageId);
+          retryCounts.set(messageId, 0);
+        } else {
+          console.warn(
+            `Message ${messageId} was not recovered. ` +
+            `Database status: ${status ?? 'missing'}.`
+          );
+        }
+
+        continue;
+      }
+
+      recoveredPackets.push(packet);
+      failedMessages.delete(messageId);
+      retryCounts.set(messageId, 0);
+    } catch (error) {
+      console.error(
+        `Could not recover message ${messageId}:`,
+        error.message
+      );
+      // Leave the failed packet in memory for another attempt.
+    }
   }
 
-  if (recoveredPackets.length > 0) {
-    // Place recovered messages before newer pending messages.
+    if (recoveredPackets.length > 0) {
+    // Preserve failed messages' order ahead of newer queued messages.
     pendingMessages.unshift(...recoveredPackets);
 
     console.log(
@@ -194,22 +231,28 @@ function recoverFailedMessages() {
       `Messages still awaiting recovery: ${failedMessages.size}`
     );
   }
-}
 
+  return recoveredPackets.length;
+}
 
 // Display a startup message.
 console.log(`Server Node A running on ws://localhost:${PORT}`);
 
 // Broadcast a message to browser clients connected to Node A.
 function broadcastToClients(message) {
+  // Convert structured packets into JSON before sending.
+  const serializedMessage =
+    typeof message === 'string'
+      ? message
+      : JSON.stringify(message);
+
   clients.forEach((client) => {
     // Send only if the browser connection is open.
     if (client.readyState === WebSocket.OPEN) {
-      client.send(message);
+      client.send(serializedMessage);
     }
   });
 }
-
 
 function sendToPeer(packet) {
   let messageId;
@@ -285,29 +328,25 @@ function clearAckTimer(messageId) {
 
 // Retry a message when its ACK does not arrive in time.
 function scheduleAckTimeout(messageId) {
-  // Prevent multiple timers for the same message.
   clearAckTimer(messageId);
 
-  const timer = setTimeout(() => {
+  const timer = setTimeout(async () => {
     ackTimers.delete(messageId);
 
-    // The message may have been acknowledged while the timer
-    // was waiting to execute.
     if (!awaitingAcks.has(messageId)) {
       return;
     }
 
-    // If the message was removed from the queue, nothing remains
-    // to retry.
-    const stillQueued = pendingMessages.some((queuedPacket) => {
-      try {
-        return JSON.parse(queuedPacket).id === messageId;
-      } catch (error) {
-        return false;
-      }
-    });
+    const findQueuedIndex = () =>
+      pendingMessages.findIndex((queuedPacket) => {
+        try {
+          return JSON.parse(queuedPacket).id === messageId;
+        } catch (error) {
+          return false;
+        }
+      });
 
-    if (!stillQueued) {
+    if (findQueuedIndex() === -1) {
       awaitingAcks.delete(messageId);
       retryCounts.delete(messageId);
       return;
@@ -316,54 +355,166 @@ function scheduleAckTimeout(messageId) {
     const retries = (retryCounts.get(messageId) || 0) + 1;
     retryCounts.set(messageId, retries);
 
-    // Stop automatic retries after the configured limit.
     if (retries > MAX_RETRIES) {
-    const index = pendingMessages.findIndex((queuedPacket) => {
-    try {
-      return JSON.parse(queuedPacket).id === messageId;
-    } catch (error) {
-      return false;
+      try {
+        const recorded = await messageStore.markDeliveryFailed(
+          messageId,
+          'B',
+          `Maximum delivery retries exceeded (${MAX_RETRIES}).`
+        );
+
+        // An ACK may have arrived during the database operation.
+        if (!awaitingAcks.has(messageId)) {
+          return;
+        }
+
+        if (!recorded) {
+          const status = await messageStore.getDeliveryStatus(
+            messageId,
+            'B'
+          );
+
+          // Recheck after the second asynchronous database operation.
+          if (!awaitingAcks.has(messageId)) {
+            return;
+          }
+
+          if (status === 'acknowledged') {
+            const index = findQueuedIndex();
+
+            if (index !== -1) {
+              pendingMessages.splice(index, 1);
+            }
+
+            failedMessages.delete(messageId);
+            awaitingAcks.delete(messageId);
+            retryCounts.delete(messageId);
+
+            console.log(
+              `Delivery ${messageId} was already acknowledged in PostgreSQL.`
+            );
+
+            flushingQueue = false;
+            void flushPendingMessages();
+            return;
+          }
+
+          if (status === 'failed') {
+            const index = findQueuedIndex();
+
+            if (index !== -1) {
+              const [failedPacket] = pendingMessages.splice(index, 1);
+              failedMessages.set(messageId, failedPacket);
+            }
+
+            awaitingAcks.delete(messageId);
+            retryCounts.delete(messageId);
+
+            console.warn(
+              `Delivery ${messageId} is already marked failed in PostgreSQL.`
+            );
+            console.warn(
+              `Messages awaiting recovery: ${failedMessages.size}`
+            );
+
+            flushingQueue = false;
+            void flushPendingMessages();
+            return;
+          }
+
+          console.warn(
+            `Could not confirm failed delivery state for ${messageId}. ` +
+            `Database status: ${status ?? 'missing'}.`
+          );
+
+          // Keep the packet queued and retry later.
+          awaitingAcks.delete(messageId);
+          flushingQueue = false;
+          scheduleDatabaseRetry();
+          return;
+        }
+      } catch (error) {
+        console.error(
+          `Could not persist failed delivery for ${messageId}:`,
+          error.message
+        );
+
+        // Preserve the message; release the queue lock before recovery.
+        awaitingAcks.delete(messageId);
+        flushingQueue = false;
+        scheduleDatabaseRetry();
+        return;
+      }
+
+      // Do not change memory state if an ACK arrived during persistence.
+      if (!awaitingAcks.has(messageId)) {
+        flushingQueue = false;
+        void flushPendingMessages();
+        return;
+      }
+
+      const index = findQueuedIndex();
+
+      if (index !== -1) {
+        const [failedPacket] = pendingMessages.splice(index, 1);
+        failedMessages.set(messageId, failedPacket);
+      }
+
+      awaitingAcks.delete(messageId);
+      retryCounts.delete(messageId);
+
+      console.error(
+        `Message ${messageId} failed after ${MAX_RETRIES} retries.`
+      );
+      console.error(
+        `Messages awaiting recovery: ${failedMessages.size}`
+      );
+
+      flushingQueue = false;
+      void flushPendingMessages();
+      return;
     }
-    });
-
-    if (index !== -1) {
-    const [failedPacket] = pendingMessages.splice(index, 1);
-    failedMessages.set(messageId, failedPacket);
-   }
-
-    awaitingAcks.delete(messageId);
-    retryCounts.delete(messageId);
-
-    console.error(
-    `Message ${messageId} failed after ${MAX_RETRIES} retries.`
-    );
-
-    console.error(
-    `Messages awaiting recovery: ${failedMessages.size}`
-   );
-
-  // Continue processing any remaining queued messages.
-  flushingQueue = false;
-  flushPendingMessages();
-  return;
-  }
 
     console.log(
       `ACK timeout for ${messageId}. Retry attempt ${retries}.`
     );
 
-    // Allow flushPendingMessages() to resend the same packet.
     awaitingAcks.delete(messageId);
     flushingQueue = false;
-
-    flushPendingMessages();
+    void flushPendingMessages();
   }, ACK_TIMEOUT_MS);
 
   ackTimers.set(messageId, timer);
 }
 
 // Remove a message only after its ACK arrives.
-function acknowledgeMessage(messageId) {
+async function acknowledgeMessage(messageId) {
+  try {
+    // Persist the acknowledgement before changing in-memory state.
+    const recorded = await messageStore.acknowledgeDelivery(
+      messageId,
+      'B'
+    );
+
+            if (!recorded) {
+      console.error(
+        `Could not confirm persisted ACK for message ${messageId}. ` +
+        'The message remains queued.'
+      );
+
+      // Preserve the queue and retry tracking.
+      return;
+    }
+  } catch (error) {
+    console.error(
+      `Could not persist ACK for message ${messageId}:`,
+      error.message
+    );
+
+    // Preserve the queue and retry tracking if PostgreSQL is unavailable.
+    return;
+  }
+
   const index = pendingMessages.findIndex((queuedPacket) => {
     try {
       return JSON.parse(queuedPacket).id === messageId;
@@ -372,7 +523,6 @@ function acknowledgeMessage(messageId) {
     }
   });
 
-  // Stop any timeout and clear retry tracking.
   clearAckTimer(messageId);
   awaitingAcks.delete(messageId);
   retryCounts.delete(messageId);
@@ -380,22 +530,22 @@ function acknowledgeMessage(messageId) {
   const wasPreviouslyFailed = failedMessages.delete(messageId);
 
   if (index !== -1) {
-  pendingMessages.splice(index, 1);
+    pendingMessages.splice(index, 1);
 
-  console.log(`Message acknowledged: ${messageId}`);
-  console.log(
-    `Remaining queued messages: ${pendingMessages.length}`
-  );
-} else if (wasPreviouslyFailed) {
-  console.log(
-    `Late ACK received; recovered failed message: ${messageId}`
-  );
-} else {
-  console.log(`ACK received for message: ${messageId}`);
-}
+    console.log(`Message acknowledged: ${messageId}`);
+    console.log(
+      `Remaining queued messages: ${pendingMessages.length}`
+    );
+  } else if (wasPreviouslyFailed) {
+    console.log(
+      `Late ACK received; recovered failed message: ${messageId}`
+    );
+  } else {
+    console.log(`ACK received for message: ${messageId}`);
+  }
 
-// Continue processing the next queued message.
-flushPendingMessages();
+  // Continue with the next FIFO message.
+  flushPendingMessages();
 }
 
 // Send an acknowledgement to the peer server.
@@ -409,19 +559,106 @@ function sendAcknowledgement(peer, messageId) {
 }
 
 
-// Send the oldest queued message and wait for its ACK.
-function flushPendingMessages() {
-  if (flushingQueue) return;
-
-  if (
-  !peerSocket ||
-  peerSocket.readyState !== WebSocket.OPEN ||
-  !peerAuthenticated
-  ) {
-  return;
+function scheduleDatabaseRetry() {
+  if (databaseRetryTimer) {
+    return;
   }
 
-  if (pendingMessages.length === 0) return;
+  databaseRetryTimer = setTimeout(() => {
+    databaseRetryTimer = null;
+    void loadPersistedDeliveries();
+  }, ACK_TIMEOUT_MS);
+}
+
+// Restore pending deliveries destined for Node B.
+async function loadPersistedDeliveries() {
+  if (recoveringDeliveries) {
+    return;
+  }
+
+  recoveringDeliveries = true;
+
+  try {
+    const persistedMessages =
+      await messageStore.getPendingDeliveries(
+        'B',
+        MAX_PENDING_MESSAGES
+      );
+
+    for (const message of persistedMessages) {
+      const messageId = message.id;
+
+      // Do not duplicate packets already waiting in memory.
+      const alreadyQueued = pendingMessages.some((queuedPacket) => {
+        try {
+          return JSON.parse(queuedPacket).id === messageId;
+        } catch (error) {
+          return false;
+        }
+      });
+
+      // Failed messages require explicit recovery.
+      if (alreadyQueued || failedMessages.has(messageId)) {
+        continue;
+      }
+
+      if (pendingMessages.length >= MAX_PENDING_MESSAGES) {
+        console.warn(
+          'Node A queue is full; remaining persisted deliveries ' +
+          'will stay in PostgreSQL.'
+        );
+        break;
+      }
+
+      const packet = JSON.stringify({
+        type: 'chat',
+        id: message.id,
+        senderUserId: String(message.senderUserId),
+        username: message.username,
+        originNode: message.originNode,
+        text: message.text
+      });
+
+      pendingMessages.push(packet);
+      retryCounts.set(messageId, message.retryCount || 0);
+    }
+
+    console.log(
+      `Node A restored persisted deliveries. ` +
+      `Pending count: ${pendingMessages.length}`
+    );
+  } catch (error) {
+    console.error(
+      'Node A could not load persisted deliveries:',
+      error.message
+    );
+
+    scheduleDatabaseRetry();
+  } finally {
+    recoveringDeliveries = false;
+  }
+
+  void flushPendingMessages();
+}
+
+
+// Send the oldest queued message and wait for its ACK.
+async function flushPendingMessages() {
+  if (
+  flushingQueue ||
+  recoveringDeliveries ||
+  pendingMessages.length === 0
+) {
+  return;
+}
+
+  if (
+    !peerSocket ||
+    peerSocket.readyState !== WebSocket.OPEN ||
+    !peerAuthenticated
+  ) {
+    return;
+  }
 
   const packet = pendingMessages[0];
   let messageId;
@@ -433,13 +670,107 @@ function flushPendingMessages() {
     return;
   }
 
-  // Do not send a message that is already awaiting its ACK.
-  if (awaitingAcks.has(messageId)) return;
+  if (awaitingAcks.has(messageId)) {
+    return;
+  }
 
-  flushingQueue = true;
   const currentPeer = peerSocket;
+  const retries = retryCounts.get(messageId) || 0;
 
-  // Track the message before sending it.
+  // Lock the queue while the database records this attempt.
+  flushingQueue = true;
+
+  try {
+
+const recorded = await messageStore.markDeliveryAttempt(
+  messageId,
+  'B',
+  retries
+);
+
+if (!recorded) {
+  const status = await messageStore.getDeliveryStatus(
+    messageId,
+    'B'
+  );
+
+  if (status === 'acknowledged') {
+    const index = pendingMessages.indexOf(packet);
+
+    if (index !== -1) {
+      pendingMessages.splice(index, 1);
+    }
+
+    const timer = ackTimers.get(messageId);
+
+    if (timer) {
+      clearTimeout(timer);
+      ackTimers.delete(messageId);
+    }
+
+    failedMessages.delete(messageId);
+    awaitingAcks.delete(messageId);
+    retryCounts.delete(messageId);
+
+    console.log(
+      `Message ${messageId} was already acknowledged in PostgreSQL.`
+    );
+
+    flushingQueue = false;
+    void flushPendingMessages();
+    return;
+  }
+
+  if (status === 'failed') {
+    const index = pendingMessages.indexOf(packet);
+
+    if (index !== -1) {
+      const [failedPacket] = pendingMessages.splice(index, 1);
+      failedMessages.set(messageId, failedPacket);
+    }
+
+    awaitingAcks.delete(messageId);
+
+    console.warn(
+      `Message ${messageId} is marked failed in PostgreSQL.`
+    );
+
+    flushingQueue = false;
+    void flushPendingMessages();
+    return;
+  }
+
+  console.warn(
+    `Could not confirm delivery state for ${messageId}. ` +
+    `Database status: ${status ?? 'missing'}.`
+  );
+
+  flushingQueue = false;
+  scheduleDatabaseRetry();
+  return;
+}
+} catch (error) {
+  console.error(
+    `Database error recording delivery attempt for ${messageId}:`,
+    error.message
+  );
+
+  flushingQueue = false;
+  scheduleDatabaseRetry();
+  return;
+  }
+
+  // Recheck the connection and queue after awaiting PostgreSQL.
+  if (
+    peerSocket !== currentPeer ||
+    currentPeer.readyState !== WebSocket.OPEN ||
+    !peerAuthenticated ||
+    pendingMessages[0] !== packet
+  ) {
+    flushingQueue = false;
+    return;
+  }
+
   awaitingAcks.add(messageId);
 
   console.log(`Sending message ${messageId} to peer`);
@@ -448,19 +779,16 @@ function flushPendingMessages() {
     flushingQueue = false;
 
     if (error) {
-  console.error(
-    'Message send failed; keeping it queued:',
-    error.message
-  );
+      console.error(
+        'Message send failed; keeping it queued:',
+        error.message
+      );
 
-  // Keep tracking the message and retry after the timeout.
-  // The peer's close handler will clear this state if it disconnects.
-  scheduleAckTimeout(messageId);
+      scheduleAckTimeout(messageId);
+      return;
+    }
 
-  return;
-}
-
-    // The ACK might already have arrived before this callback.
+    // The ACK could arrive before this callback executes.
     const stillQueued = pendingMessages.some((queuedPacket) => {
       try {
         return JSON.parse(queuedPacket).id === messageId;
@@ -476,11 +804,10 @@ function flushPendingMessages() {
     ) {
       console.log(`Waiting for ACK for message ${messageId}`);
       scheduleAckTimeout(messageId);
-    }
-
-    // If an ACK already removed this packet, process the next one.
-    if (!stillQueued) {
-      flushPendingMessages();
+    } else {
+      // Continue only if the previous message is no longer blocking
+      // the queue and the current connection remains authenticated.
+      void flushPendingMessages();
     }
   });
 }
@@ -541,7 +868,7 @@ function connectToNodeB() {
   // Save this connection.
   peerSocket = peer;
 
- 
+
 peer.on('open', () => {
   if (peerSocket !== peer) {
     return;
@@ -558,67 +885,90 @@ peer.on('open', () => {
   console.log('Sent peer authentication to Node B.');
 });
 
-peer.on('message', (data) => {
+
+peer.on('message', async (data) => {
   try {
     const packet = JSON.parse(data.toString());
 
     // Wait for Node B to confirm the internal authentication handshake.
-  if (!peerAuthenticated) {
-  if (packet.type !== 'peer_auth_success') {
-    console.error('Node B did not confirm peer authentication.');
-    peer.close(1008, 'Peer authentication failed');
-    return;
-  }
-
-  peerAuthenticated = true;
-  peerConnected = true;
-  reconnectAttempts = 0;
-
-  console.log('Successfully authenticated with Node B.');
-
-  recoverFailedMessages();
-  flushPendingMessages();
-  return;
-  }
-
-    // Handle an acknowledgement from Node B.
-    if (
-      packet.type === 'ack' &&
-      typeof packet.id === 'string'
-    ) {
-      acknowledgeMessage(packet.id);
-      return;
-    }
-
-    // Handle a chat message from Node B.
-    if (
-      packet.type === 'chat' &&
-      typeof packet.id === 'string' &&
-      typeof packet.text === 'string'
-    ) {
-      // Even duplicates must be acknowledged.
-      // Otherwise, Node B may retry the same message indefinitely.
-      if (!rememberMessageId(packet.id)) {
-        console.log('Duplicate message ignored:', packet.id);
-        sendAcknowledgement(peer, packet.id);
+    if (!peerAuthenticated) {
+      if (packet.type !== 'peer_auth_success') {
+        console.error('Node B did not confirm peer authentication.');
+        peer.close(1008, 'Peer authentication failed');
         return;
       }
 
-      console.log('Received message from Node B:', packet.text);
+      peerAuthenticated = true;
+      peerConnected = true;
+      reconnectAttempts = 0;
 
-      // Deliver the message to Node A's browser clients.
-      broadcastToClients(packet.text);
+      console.log('Successfully authenticated with Node B.');
 
-      // Confirm that Node A has processed the message.
-      sendAcknowledgement(peer, packet.id);
+      void loadPersistedDeliveries();
+      return;
+    }
+
+    // Handle an acknowledgement from Node B.
+    if (packet.type === 'ack' && typeof packet.id === 'string') {
+      void acknowledgeMessage(packet.id);
+      return;
+    }
+
+    // Persist incoming messages from Node B before acknowledging them.
+    if (
+      packet.type === 'chat' &&
+      typeof packet.id === 'string' &&
+      typeof packet.text === 'string' &&
+      Number.isInteger(Number(packet.senderUserId)) &&
+      Number(packet.senderUserId) > 0 &&
+      typeof packet.username === 'string' &&
+      (packet.originNode === 'A' || packet.originNode === 'B')
+    ) {
+      try {
+        const firstReceipt = await messageStore.persistIncomingMessage(
+          {
+            id: packet.id,
+            senderUserId: Number(packet.senderUserId),
+            username: packet.username,
+            originNode: packet.originNode,
+            text: packet.text
+          },
+          'A'
+        );
+
+        // Remember the ID only after persistence succeeds.
+        rememberMessageId(packet.id);
+
+        if (!firstReceipt) {
+          console.log(
+            'Duplicate message already persisted; acknowledging:',
+            packet.id
+          );
+
+          // ACK retries so Node B does not retry forever.
+          sendAcknowledgement(peer, packet.id);
+          return;
+        }
+
+        // Deliver to browser clients only after successful persistence.
+        broadcastToClients(`${packet.username}: ${packet.text}`);
+
+        // ACK only after PostgreSQL confirms the message is saved.
+        sendAcknowledgement(peer, packet.id);
+      } catch (error) {
+        console.error(
+          `Could not persist incoming message ${packet.id}:`,
+          error.message
+        );
+
+        // No ACK: Node B can retry delivery.
+      }
     }
   } catch (error) {
-    console.error(
-      'Invalid message received from Node B:',
-      error.message
-    );
+    console.error('Error processing message from Node B:', error.message);
   }
 });
+
 
   peer.on('close', () => {
   // Ignore events from an old connection.
@@ -648,7 +998,7 @@ peer.on('message', (data) => {
 });
 
   peer.on('error', () => {
-  
+
   // Avoid logging a separate error for every failed attempt.
 });
 }
@@ -670,7 +1020,7 @@ server.on('connection', (socket) => {
     }
   }, 5000);
 
-  socket.on('message', (data) => {
+  socket.on('message', async(data) => {
     const incomingData = data.toString();
 
     // STEP 1: Require authentication as the first message.
@@ -741,24 +1091,30 @@ server.on('connection', (socket) => {
       return;
     }
 
-    // STEP 3: Handle the existing recovery command.
+        // STEP 3: Handle explicit recovery of failed messages.
     if (userMessage.toLowerCase() === '/recover') {
-      const failedBefore = failedMessages.size;
+      try {
+        const recovered = await recoverFailedMessages();
 
-      recoverFailedMessages();
+        void flushPendingMessages();
 
-      const recovered = failedBefore - failedMessages.size;
+        if (socket.readyState === WebSocket.OPEN) {
+          if (recovered > 0) {
+            socket.send(
+              `System: Recovered ${recovered} failed message(s).`
+            );
+          } else {
+            socket.send(
+              'System: No failed messages were available for recovery.'
+            );
+          }
+        }
+      } catch (error) {
+        console.error('Failed to recover messages:', error.message);
 
-      flushPendingMessages();
-
-      if (socket.readyState === WebSocket.OPEN) {
-        if (recovered > 0) {
+        if (socket.readyState === WebSocket.OPEN) {
           socket.send(
-            `System: Recovered ${recovered} failed message(s).`
-          );
-        } else {
-          socket.send(
-            'System: No failed messages were available for recovery.'
+            'System: Message recovery failed. Please try again later.'
           );
         }
       }
@@ -766,34 +1122,59 @@ server.on('connection', (socket) => {
       return;
     }
 
-    // STEP 4: Build the sender identity from the verified token.
-    // Never accept the sender's identity from the browser message.
-    const message = `${socket.username}: ${userMessage}`;
-
-    console.log(`Node A received: ${message}`);
-
-    // STEP 5: Create a unique message ID.
-    const messageId = crypto.randomUUID();
-
-    rememberMessageId(messageId);
-
-    // STEP 6: Preserve the existing distributed message format.
-    const packet = JSON.stringify({
+    // STEP 4: Build a persistent message packet using the verified identity.
+    const messagePacket = {
       type: 'chat',
-      id: messageId,
-      text: message
-    });
+      id: crypto.randomUUID(),
+      senderUserId: Number(socket.userId),
+      username: socket.username,
+      originNode: 'A',
+      text: userMessage
+    };
 
-    // STEP 7: Broadcast locally and queue delivery to Node B.
-    broadcastToClients(message);
+    // STEP 5: Persist the message before broadcasting or queuing it.
+    try {
+      await messageStore.persistOutgoingMessage(messagePacket, 'B');
+    } catch (error) {
+      console.error(
+        `Could not persist outgoing message ${messagePacket.id}:`,
+        error.message
+      );
 
-    const queued = sendToPeer(packet);
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.send(
+          'System: Your message could not be saved. Please try again later.'
+        );
+      }
+
+      return;
+    }
+
+    // STEP 6: Record the persisted message ID in memory.
+    rememberMessageId(messagePacket.id);
+
+    console.log(
+  `Node A received: ${messagePacket.username}: ${messagePacket.text}`
+);
+
+// Broadcast the persisted message as a structured chat packet.
+broadcastToClients({
+  type: 'chat',
+  id: messagePacket.id,
+  senderUserId: messagePacket.senderUserId,
+  username: messagePacket.username,
+  originNode: messagePacket.originNode,
+  text: messagePacket.text
+});
+
+    // STEP 8: Queue delivery to Node B using the existing retry mechanism.
+    const queued = sendToPeer(JSON.stringify(messagePacket));
 
     // Notify the sender if the peer queue is full.
     if (!queued && socket.readyState === WebSocket.OPEN) {
       socket.send(
-        'System: Message was not queued because the pending queue is full. ' +
-        'Please try again later.'
+        'System: Message was saved, but the pending delivery queue is full. ' +
+        'It may not reach Node B until recovery. Please check before resending.'
       );
     }
   });

@@ -1451,7 +1451,8 @@
 
   <script>
     // Production Node B WebSocket server.
-    const SERVER_URL = 'wss://chat-node-b.onrender.com';
+    //const SERVER_URL = 'wss://chat-node-b.onrender.com';
+    const SERVER_URL = 'ws://localhost:8081';
 
     // Production authentication API.
     const AUTH_API_URL = 'https://chat-auth-api.onrender.com/api';
@@ -1780,44 +1781,65 @@
         reconnecting = false;
       });
 
-      newSocket.addEventListener('message', (event) => {
-        if (socket !== newSocket) return;
 
-        const received = String(event.data);
+newSocket.addEventListener('message', (event) => {
+  if (socket !== newSocket) return;
 
-        try {
-          const packet = JSON.parse(received);
+  const received = String(event.data);
 
-          if (packet.type === 'auth_success') {
-            isAuthenticated = true;
+  try {
+    const packet = JSON.parse(received);
 
-            authenticatedUsername =
-              packet.user?.username || authenticatedUsername;
+    if (packet.type === 'auth_success') {
+      isAuthenticated = true;
 
-            currentUsername.textContent =
-              authenticatedUsername || 'Authenticated user';
+      authenticatedUsername =
+        packet.user?.username || authenticatedUsername;
 
-            userAvatar.textContent =
-              (authenticatedUsername.trim().charAt(0) || 'U').toUpperCase();
+      currentUsername.textContent =
+        authenticatedUsername || 'Authenticated user';
 
-            setConnectionStatus('Authenticated and connected to Node B', 'connected');
-            sendButton.disabled = false;
-            messageInput.focus();
+      userAvatar.textContent =
+        (authenticatedUsername.trim().charAt(0) || 'U').toUpperCase();
 
-            displayMessage('You are securely connected to Node B.', true);
-            return;
-          }
+      setConnectionStatus('Authenticated and connected to Node B', 'connected');
+      sendButton.disabled = false;
+      messageInput.focus();
 
-          if (packet.type === 'auth_error') {
-            displayMessage(packet.message || 'Authentication failed.', true);
-            return;
-          }
-        } catch (error) {
-          // Regular chat messages are plain text rather than JSON.
-        }
+      displayMessage('You are securely connected to Node B.', true);
+      return;
+    }
 
-        displayMessage(received);
-      });
+    if (packet.type === 'auth_error') {
+      displayMessage(packet.message || 'Authentication failed.', true);
+      return;
+    }
+
+    if (packet.type === 'chat') {
+      const text = typeof packet.text === 'string'
+        ? `${packet.username || 'User'}: ${packet.text}`
+        : '';
+
+      if (text) displayMessage(text);
+      return;
+    }
+
+    if (packet.type === 'system') {
+      displayMessage(packet.text || packet.message || 'System notification', true);
+      return;
+    }
+
+    // Preserve compatibility with other JSON packets.
+    if (packet.type) {
+      console.log('Received WebSocket packet:', packet);
+      return;
+    }
+  } catch (error) {
+    // Existing plain-text chat messages are supported below.
+  }
+
+  displayMessage(received);
+});
 
       newSocket.addEventListener('close', (event) => {
         if (socket !== newSocket) return;

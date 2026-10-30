@@ -1451,7 +1451,8 @@
 
   <script>
     // Production Node A WebSocket server.
-    const SERVER_URL = 'wss://chat-node-a.onrender.com';
+    //const SERVER_URL = 'wss://chat-node-a.onrender.com';
+    const SERVER_URL = 'ws://localhost:8090';
 
     // Production authentication API.
     const AUTH_API_URL = 'https://chat-auth-api.onrender.com/api';
@@ -1763,60 +1764,83 @@
       socket = newSocket;
 
       newSocket.addEventListener('open', () => {
-        if (socket !== newSocket) return;
+  if (socket !== newSocket) return;
 
-        newSocket.send(JSON.stringify({
-          type: 'auth',
-          token
-        }));
+  // Send the JWT to Node A immediately after connection.
+  newSocket.send(JSON.stringify({
+    type: 'auth',
+    token
+  }));
 
-        setConnectionStatus('Connected. Verifying your session...');
-        if (reconnectTimer !== null) {
-          clearTimeout(reconnectTimer);
-          reconnectTimer = null;
-        }
+  setConnectionStatus('Connected. Verifying your session...');
 
-        reconnecting = false;
-      });
+  if (reconnectTimer !== null) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
 
-      newSocket.addEventListener('message', (event) => {
-        if (socket !== newSocket) return;
+  reconnecting = false;
+});
 
-        const received = String(event.data);
 
-        try {
-          const packet = JSON.parse(received);
+newSocket.addEventListener('message', (event) => {
+  if (socket !== newSocket) return;
 
-          if (packet.type === 'auth_success') {
-            isAuthenticated = true;
+  const received = String(event.data);
 
-            authenticatedUsername =
-              packet.user?.username || authenticatedUsername;
+  try {
+    const packet = JSON.parse(received);
 
-            currentUsername.textContent =
-              authenticatedUsername || 'Authenticated user';
+    if (packet.type === 'auth_success') {
+      isAuthenticated = true;
 
-            userAvatar.textContent =
-              (authenticatedUsername.trim().charAt(0) || 'U').toUpperCase();
+      authenticatedUsername =
+        packet.user?.username || authenticatedUsername;
 
-            setConnectionStatus('Authenticated and connected to Node A', 'connected');
-            sendButton.disabled = false;
-            messageInput.focus();
+      currentUsername.textContent =
+        authenticatedUsername || 'Authenticated user';
 
-            displayMessage('You are securely connected to Node A.', true);
-            return;
-          }
+      userAvatar.textContent =
+        (authenticatedUsername.trim().charAt(0) || 'U').toUpperCase();
 
-          if (packet.type === 'auth_error') {
-            displayMessage(packet.message || 'Authentication failed.', true);
-            return;
-          }
-        } catch (error) {
-          // Regular chat messages are plain text rather than JSON.
-        }
+      setConnectionStatus('Authenticated and connected to Node A', 'connected');
+      sendButton.disabled = false;
+      messageInput.focus();
 
-        displayMessage(received);
-      });
+      displayMessage('You are securely connected to Node A.', true);
+      return;
+    }
+
+    if (packet.type === 'auth_error') {
+      displayMessage(packet.message || 'Authentication failed.', true);
+      return;
+    }
+
+    if (packet.type === 'chat') {
+      const text = typeof packet.text === 'string'
+        ? `${packet.username || 'User'}: ${packet.text}`
+        : '';
+
+      if (text) displayMessage(text);
+      return;
+    }
+
+    if (packet.type === 'system') {
+      displayMessage(packet.text || packet.message || 'System notification', true);
+      return;
+    }
+
+    // Preserve compatibility with other JSON packets.
+    if (packet.type) {
+      console.log('Received WebSocket packet:', packet);
+      return;
+    }
+  } catch (error) {
+    // Existing plain-text chat messages are supported below.
+  }
+
+  displayMessage(received);
+});
 
       newSocket.addEventListener('close', (event) => {
         if (socket !== newSocket) return;
