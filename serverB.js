@@ -357,7 +357,8 @@ async function loadPersistedDeliveries() {
         senderUserId: String(message.senderUserId),
         username: message.username,
         originNode: message.originNode,
-        text: message.text
+        text: message.text,
+        createdAt: message.createdAt
       });
 
       pendingMessages.push(packet);
@@ -1078,7 +1079,8 @@ server.on('connection', (socket, request) => {
   senderUserId: packet.senderUserId,
   username: packet.username,
   originNode: packet.originNode,
-  text: packet.text
+  text: packet.text,
+  createdAt: packet.createdAt
 });
 
           // ACK only after PostgreSQL confirms persistence.
@@ -1315,7 +1317,8 @@ if (recoveryCommand === '/recover') {
             senderUserId: parsed.senderUserId,
             username: parsed.username,
             originNode: parsed.originNode,
-            text: parsed.text
+            text: parsed.text,
+            createdAt: parsed.createdAt
           });
         }
 
@@ -1410,10 +1413,8 @@ if (recoveryCommand === '/recover') {
 
     // Save the message and delivery record before broadcasting.
     try {
-      await messageStore.persistOutgoingMessage(
-        messagePacket,
-        'A'
-      );
+      messagePacket.createdAt =
+       await messageStore.persistOutgoingMessage(messagePacket, 'A');
     } catch (error) {
       console.error(
         `Could not persist outgoing message ${messagePacket.id}:`,
@@ -1439,7 +1440,8 @@ broadcastToClients({
   senderUserId: messagePacket.senderUserId,
   username: messagePacket.username,
   originNode: messagePacket.originNode,
-  text: messagePacket.text
+  text: messagePacket.text,
+  createdAt: messagePacket.createdAt
 });
     // Preserve the existing queue, retry, and ACK mechanisms.
     const queued = sendToPeer(JSON.stringify(messagePacket));

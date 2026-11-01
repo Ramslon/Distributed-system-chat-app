@@ -1401,6 +1401,13 @@
             </div>
             <span class="conversation-tag">REAL-TIME</span>
           </div>
+          <!-- History Pagination -->
+          <div class="history-controls">
+            <button id="loadOlderButton" class="outline-button" type="button" hidden
+            >
+              Load older messages
+            </button>
+          </div>
 
           <!-- Keep the empty-state prompt until an actual chat message is received. -->
           <div id="chat" class="chat" role="log"
@@ -1450,13 +1457,18 @@
   </div>
 
   <script>
-    // Production Node B WebSocket server.
-    const SERVER_URL = 'wss://chat-node-b.onrender.com';
-    //Local development WebSocket server.
-    //const SERVER_URL = 'ws://localhost:8081';
-
-    // Production authentication API.
-    const AUTH_API_URL = 'https://chat-auth-api.onrender.com/api';
+    // Determine the appropriate server URLs based on the environment.
+    const isLocal = ['localhost', '127.0.0.1'].includes(
+     window.location.hostname
+    );
+    // Use WebSocket (ws) for local development and secure WebSocket (wss) for production.
+    const SERVER_URL = isLocal
+      ? 'ws://localhost:8081'
+      : 'wss://chat-node-b.onrender.com';
+    // Use the local API for development and the deployed API for production.
+    const AUTH_API_URL = isLocal
+      ? 'http://localhost:3000/api'
+      : 'https://chat-auth-api.onrender.com/api';
 
     const authSection = document.getElementById('authSection');
     const loginForm = document.getElementById('loginForm');
@@ -1488,6 +1500,7 @@
     const statusText = document.getElementById('statusText');
     const chat = document.getElementById('chat');
     const emptyState = document.getElementById('emptyState');
+    const loadOlderButton = document.getElementById('loadOlderButton');
 
     const headerNodeDot = document.getElementById('headerNodeDot');
     const sidebarNodeDot = document.getElementById('sidebarNodeDot');
@@ -1498,11 +1511,114 @@
     let isAuthenticated = false;
     let authenticatedUsername = '';
 
+    // Track message IDs to prevent duplicate rendering.
+    const displayedMessageIds = new Set();
+
+    // Track pagination state for chat history.
+    let historyCursor = null;
+    let hasMoreHistory = false;
+    let isLoadingHistory = false;
+
     const RECONNECT_DELAY = 2000;
 
     function getToken() {
       return sessionStorage.getItem('chatToken');
     }
+
+    // Load previously stored chat messages from the authenticated API.
+async function loadMessageHistory() {
+  const token = getToken();
+
+  // Prevent requests without authentication or overlapping requests.
+  if (!token || !isAuthenticated || isLoadingHistory) {
+    return;
+  }
+
+  // Determine whether this is the initial history load.
+  const isInitialHistoryLoad = historyCursor === null;
+
+  // Preserve the current scroll position when loading older messages.
+  const previousScrollHeight = chat.scrollHeight;
+  const previousScrollTop = chat.scrollTop;
+
+  isLoadingHistory = true;
+
+  // Prevent repeated clicks while history is loading.
+  loadOlderButton.disabled = true;
+  loadOlderButton.textContent = 'Loading...';
+
+  try {
+    // Build the history URL with an optional pagination cursor.
+    const historyUrl = new URL(`${AUTH_API_URL}/messages/history`);
+
+    historyUrl.searchParams.set('limit', '50');
+
+    if (historyCursor) {
+      historyUrl.searchParams.set(
+        'cursor',
+        JSON.stringify(historyCursor)
+      );
+    }
+
+    const response = await fetch(historyUrl, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json'
+      }
+    });
+
+    if (!response.ok) {
+      throw new Error(`History request failed: HTTP ${response.status}`);
+    }
+
+    const data = await response.json();
+
+    // Ignore results if the user logged out or changed sessions.
+    if (!isAuthenticated || getToken() !== token) {
+      return;
+    }
+
+    // Save pagination information returned by the API.
+    historyCursor = data.nextCursor || null;
+    hasMoreHistory = data.hasMore === true;
+
+    // Show the button only when more history is available.
+    loadOlderButton.hidden = !hasMoreHistory;
+
+    // Display messages in chronological order.
+    if (Array.isArray(data.messages)) {
+      [...data.messages].reverse().forEach((message) => {
+        displayMessage(message, false, true);
+      });
+
+      if (isInitialHistoryLoad) {
+        // Show the latest messages after the initial history load.
+        chat.scrollTop = chat.scrollHeight;
+      } else {
+        // Preserve the user's reading position when older messages are added.
+        chat.scrollTop =
+          chat.scrollHeight - previousScrollHeight + previousScrollTop;
+      }
+    }
+
+    console.log(
+      `Loaded ${data.messages?.length || 0} previous messages.`,
+      {
+        hasMoreHistory,
+        nextCursor: historyCursor
+      }
+    );
+
+  } catch (error) {
+    console.error('Could not load chat history:', error);
+  } finally {
+    // Restore the button after the request finishes.
+    isLoadingHistory = false;
+    loadOlderButton.disabled = false;
+    loadOlderButton.textContent = 'Load older messages';
+  }
+}
 
     function setConnectionStatus(message, state = 'neutral') {
       statusText.textContent = message;
@@ -1520,8 +1636,19 @@
     }
 
     // Render messages without changing the plain-text WebSocket protocol.
-    function displayMessage(text, isSystemMessage = false) {
-      const content = String(text);
+    function displayMessage(messageData, isSystemMessage = false, prepend = false) {
+      const content = typeof messageData === 'object' && messageData !== null
+        ? String(messageData.text ?? '')
+        : String(messageData);
+
+        //ignore messages that have already been displayed
+
+        if (messageData && typeof messageData === 'object' && messageData.id) {
+          if (displayedMessageIds.has(messageData.id)) {
+            return;
+          }
+          displayedMessageIds.add(messageData.id);
+        }
 
       if (isSystemMessage) {
         const notice = document.createElement('div');
@@ -1536,37 +1663,49 @@
         emptyState.remove();
       }
 
-      // Chat packets contain no timestamp, so show the time this client received them.
-      const receivedAt = new Date();
+      // Use the original database timestamp when available.
+      const receivedAt = messageData &&
+       typeof messageData === 'object' &&
+       messageData.createdAt
+       ? new Date(messageData.createdAt)
+       : new Date();
+
       const message = document.createElement('div');
       message.className = 'message';
       const messageMeta = document.createElement('div');
       messageMeta.className = 'message-meta';
 
-      // Existing servers deliver normal chat messages as plain text.
-      // Match the authenticated username to distinguish our own messages.
       let bodyText = content;
-      const separator = content.indexOf(':');
+      let sender = '';
 
-      if (separator > 0) {
-        const sender = content.slice(0, separator).trim();
-        const body = content.slice(separator + 1).trim();
+    // Structured packets contain username and text separately.
+     if (messageData && typeof messageData === 'object') {
+     sender = String(messageData.username || 'User');
+    } else {
+     // Support legacy plain-text messages: "username: message".
+    const separator = content.indexOf(':');
 
-        const isOwnMessage =
-          authenticatedUsername &&
-          sender.toLowerCase() === authenticatedUsername.toLowerCase();
+    if (separator > 0) {
+    sender = content.slice(0, separator).trim();
+    bodyText = content.slice(separator + 1).trim();
+    }
+   }
 
-        const senderLabel = document.createElement('span');
-        senderLabel.className = 'message-sender';
-        senderLabel.textContent = isOwnMessage ? 'You' : sender;
+    if (sender) {
+      const isOwnMessage =
+      authenticatedUsername &&
+      sender.toLowerCase() === authenticatedUsername.toLowerCase();
 
-        messageMeta.appendChild(senderLabel);
-        bodyText = body;
+      const senderLabel = document.createElement('span');
+      senderLabel.className = 'message-sender';
+      senderLabel.textContent = isOwnMessage ? 'You' : sender;
 
-        if (isOwnMessage) {
-          message.classList.add('own');
-        }
-      }
+      messageMeta.appendChild(senderLabel);
+
+     if (isOwnMessage) {
+      message.classList.add('own');
+  }
+}
 
       const timestamp = document.createElement('time');
       timestamp.className = 'message-time';
@@ -1583,10 +1722,17 @@
       bodyNode.textContent = bodyText;
       message.appendChild(bodyNode);
 
-      chat.appendChild(message);
-      chat.scrollTop = chat.scrollHeight;
+      //Insert older messages at the top and new messages at the bottom of the chat.
+      if (prepend) {
+        chat.insertBefore(message, chat.firstChild);
+      } else {
+        chat.appendChild(message);
+      }
+       //Keep the chat positioned at the latest messages for normall messages.
+       if (!prepend) {
+        chat.scrollTop = chat.scrollHeight;
     }
-
+  }
     function setAuthStatus(message, type = '') {
       authStatus.textContent = message;
       authStatus.className = type;
@@ -1620,6 +1766,11 @@
 
     showLoginButton.addEventListener('click', showLogin);
     showRegisterButton.addEventListener('click', showRegistration);
+
+    //Load the next page of older messages when clicked
+    loadOlderButton.addEventListener('click', () => {
+      loadMessageHistory();
+    });
 
     async function postAuthRequest(endpoint, payload) {
       const response = await fetch(`${AUTH_API_URL}/${endpoint}`, {
@@ -1808,6 +1959,9 @@ newSocket.addEventListener('message', (event) => {
       messageInput.focus();
 
       displayMessage('You are securely connected to Node B.', true);
+
+      //Load previous stored messages from the authenticated API after successful authentication.
+      loadMessageHistory();
       return;
     }
 
@@ -1817,11 +1971,7 @@ newSocket.addEventListener('message', (event) => {
     }
 
     if (packet.type === 'chat') {
-      const text = typeof packet.text === 'string'
-        ? `${packet.username || 'User'}: ${packet.text}`
-        : '';
-
-      if (text) displayMessage(text);
+      displayMessage(packet);
       return;
     }
 

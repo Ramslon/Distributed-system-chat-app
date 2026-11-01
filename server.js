@@ -616,7 +616,8 @@ async function loadPersistedDeliveries() {
         senderUserId: String(message.senderUserId),
         username: message.username,
         originNode: message.originNode,
-        text: message.text
+        text: message.text,
+        createdAt: message.createdAt
       });
 
       pendingMessages.push(packet);
@@ -951,7 +952,15 @@ peer.on('message', async (data) => {
         }
 
         // Deliver to browser clients only after successful persistence.
-        broadcastToClients(`${packet.username}: ${packet.text}`);
+        broadcastToClients({
+         type: 'chat',
+         id: packet.id,
+         senderUserId: packet.senderUserId,
+         username: packet.username,
+         originNode: packet.originNode,
+         text: packet.text,
+         createdAt: packet.createdAt
+});
 
         // ACK only after PostgreSQL confirms the message is saved.
         sendAcknowledgement(peer, packet.id);
@@ -1134,7 +1143,7 @@ server.on('connection', (socket) => {
 
     // STEP 5: Persist the message before broadcasting or queuing it.
     try {
-      await messageStore.persistOutgoingMessage(messagePacket, 'B');
+      messagePacket.createdAt = await messageStore.persistOutgoingMessage(messagePacket, 'B');
     } catch (error) {
       console.error(
         `Could not persist outgoing message ${messagePacket.id}:`,
@@ -1164,7 +1173,8 @@ broadcastToClients({
   senderUserId: messagePacket.senderUserId,
   username: messagePacket.username,
   originNode: messagePacket.originNode,
-  text: messagePacket.text
+  text: messagePacket.text,
+  createdAt: messagePacket.createdAt
 });
 
     // STEP 8: Queue delivery to Node B using the existing retry mechanism.

@@ -131,11 +131,11 @@ async function insertOrVerifyMessage(client, packet) {
   );
 
   const result = await client.query(
-    `SELECT sender_user_id, origin_node, message_text
-     FROM chat_messages
-     WHERE id = $1
-     FOR SHARE`,
-    [packet.id]
+     `SELECT sender_user_id, origin_node, message_text, created_at
+      FROM chat_messages
+      WHERE id = $1
+      FOR SHARE`,
+     [packet.id]
   );
 
   const stored = result.rows[0];
@@ -150,6 +150,8 @@ async function insertOrVerifyMessage(client, packet) {
       'Message ID conflicts with existing persisted message data.'
     );
   }
+
+   return stored.created_at.toISOString();
 }
 
 /**
@@ -191,7 +193,7 @@ async function persistOutgoingMessage(packet, destinationNode) {
   validateDestination(packet.originNode, destinationNode);
 
   return withTransaction(async (client) => {
-    await insertOrVerifyMessage(client, packet);
+    const createdAt = await insertOrVerifyMessage(client, packet);
 
     await client.query(
       `INSERT INTO message_node_receipts (message_id, node_id)
@@ -207,6 +209,8 @@ async function persistOutgoingMessage(packet, destinationNode) {
        ON CONFLICT (message_id, destination_node) DO NOTHING`,
       [packet.id, destinationNode]
     );
+
+     return createdAt;
   });
 }
 
@@ -375,7 +379,7 @@ async function getPendingDeliveries(destinationNode, limit = 1000) {
        m.message_text,
        d.retry_count,
        d.status,
-       d.created_at
+       m.created_at AS message_created_at
      FROM message_delivery_state AS d
      JOIN chat_messages AS m
        ON m.id = d.message_id
@@ -395,7 +399,8 @@ async function getPendingDeliveries(destinationNode, limit = 1000) {
     originNode: row.origin_node,
     text: row.message_text,
     retryCount: row.retry_count,
-    status: row.status
+    status: row.status,
+    createdAt: row.message_created_at.toISOString()
   }));
 }
 
@@ -477,8 +482,95 @@ async function getDeliveryStatus(messageId, destinationNode) {
     : null;
 }
 
+/**
+ * Retrieve chat history using cursor-based pagination.
+ * Messages are returned in chronological order.
+ */
+async function getMessageHistory(limit = 50, cursor = null) {
+  // Validate the requested number of messages.
+  if (
+    !Number.isSafeInteger(limit) ||
+    limit < 1 ||
+    limit > 100
+  ) {
+    throw new Error('History limit must be between 1 and 100.');
+  }
+
+  // Validate the pagination cursor when one is provided.
+  if (cursor !== null) {
+    if (
+      !cursor ||
+      typeof cursor !== 'object' ||
+      Array.isArray(cursor) ||
+      typeof cursor.createdAt !== 'string' ||
+      cursor.createdAt.length > 64 ||
+      Number.isNaN(Date.parse(cursor.createdAt)) ||
+      typeof cursor.id !== 'string' ||
+      !UUID_PATTERN.test(cursor.id)
+    ) {
+      throw new Error('Invalid message history cursor.');
+    }
+  }
+
+  // Fetch one extra record to determine whether older messages exist.
+  const result = await pool.query(
+    `SELECT
+       m.id,
+       m.sender_user_id,
+       u.username,
+       m.origin_node,
+       m.message_text,
+       m.created_at::text AS created_at
+     FROM chat_messages AS m
+     JOIN users AS u
+       ON u.id = m.sender_user_id
+     WHERE (
+       $1::timestamptz IS NULL
+       OR (m.created_at, m.id) < ($1::timestamptz, $2::uuid)
+     )
+     ORDER BY m.created_at DESC, m.id DESC
+     LIMIT $3`,
+    [
+      cursor ? cursor.createdAt : null,
+      cursor ? cursor.id : null,
+      limit + 1
+    ]
+  );
+
+  // An extra record means there are older messages available.
+  const hasMore = result.rows.length > limit;
+
+  // Keep only the requested number of messages.
+  const rows = result.rows.slice(0, limit);
+
+  // Reverse the records so the oldest appears first.
+  const messages = rows.reverse().map((row) => ({
+    id: row.id,
+    senderUserId: Number(row.sender_user_id),
+    username: row.username,
+    originNode: row.origin_node,
+    text: row.message_text,
+    createdAt: row.created_at
+  }));
+
+  // Only provide a cursor when another page is available.
+   const nextCursor = hasMore && messages.length > 0
+   ? {
+      createdAt: messages[0].createdAt,
+      id: messages[0].id
+    }
+  : null;
+
+  return {
+    messages,
+    hasMore,
+    nextCursor
+  };
+}
+
 module.exports = {
   validateMessage,
+  getMessageHistory,
   persistOutgoingMessage,
   persistIncomingMessage,
   markDeliveryAttempt,

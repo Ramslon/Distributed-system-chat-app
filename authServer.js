@@ -7,6 +7,8 @@ const jwt = require('jsonwebtoken');
 const { Pool } = require('pg');
 const helmet = require('helmet');
 const { rateLimit } = require('express-rate-limit');
+const messageStore = require('./messageStore');
+
 
 // 1. Validate configuration.
 if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) {
@@ -102,6 +104,82 @@ app.use(cors({
 // Accept JSON request bodies up to 10 KB.
 app.use(express.json({ limit: '10kb' }));
 
+// 5. Authenticate requests using JWT.
+async function authenticateToken(req, res, next) {
+  // Read the Authorization header.
+  const authHeader = req.headers.authorization;
+
+  // Require the Bearer authentication scheme.
+  const tokenMatch =
+    typeof authHeader === 'string'
+      ? authHeader.match(/^Bearer\s+(\S+)$/i)
+      : null;
+
+  if (!tokenMatch) {
+    return res.status(401).json({
+      error: 'Authentication token is required.'
+    });
+  }
+
+  const token = tokenMatch[1];
+
+  let decoded;
+
+  try {
+    // Verify the token signature and expiration.
+    decoded = jwt.verify(
+      token,
+      process.env.JWT_SECRET,
+      { algorithms: ['HS256'] }
+    );
+  } catch (error) {
+    return res.status(401).json({
+      error: 'Invalid or expired authentication token.'
+    });
+  }
+
+  // Extract the database user ID from the JWT subject.
+  const userId = Number(decoded.sub);
+
+  if (
+    !Number.isSafeInteger(userId) ||
+    userId <= 0 ||
+    userId > 2147483647
+  ) {
+    return res.status(401).json({
+      error: 'Invalid authentication token.'
+    });
+  }
+
+  try {
+    // Confirm that the authenticated account still exists.
+    const result = await pool.query(
+      `SELECT id, username
+       FROM users
+       WHERE id = $1`,
+      [userId]
+    );
+
+    if (result.rowCount !== 1) {
+      return res.status(401).json({
+        error: 'The authenticated account no longer exists.'
+      });
+    }
+
+    // Make the verified user available to the route.
+    req.authenticatedUser = {
+      id: Number(result.rows[0].id),
+      username: result.rows[0].username
+    };
+
+    // Continue to the requested endpoint.
+    return next();
+  } catch (error) {
+    // Pass database errors to the central error handler.
+    return next(error);
+  }
+}
+
 // 5. Health endpoint.
 app.get('/api/health', async (req, res) => {
   try {
@@ -117,6 +195,87 @@ app.get('/api/health', async (req, res) => {
     return res.status(503).json({
       status: 'error',
       database: 'unavailable'
+    });
+  }
+});
+
+// Retrieve paginated chat history for authenticated users.
+app.get('/api/messages/history', authenticateToken, async (req, res, next) => {
+  // Use 50 messages per page when no limit is provided.
+  const rawLimit = req.query.limit === undefined
+    ? '50'
+    : req.query.limit;
+
+  // Ensure the limit is a positive whole-number string.
+  if (
+    typeof rawLimit !== 'string' ||
+    !/^\d+$/.test(rawLimit)
+  ) {
+    return res.status(400).json({
+      error: 'History limit must be a valid whole number.'
+    });
+  }
+
+  // Convert the requested limit from a string to a number.
+  const limit = Number(rawLimit);
+
+  // Enforce the permitted page size.
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+    return res.status(400).json({
+      error: 'History limit must be between 1 and 100.'
+    });
+  }
+
+  // Start without a cursor; this retrieves the latest messages.
+  let cursor = null;
+
+  // Read and validate the cursor when the client supplies one.
+  if (req.query.cursor !== undefined) {
+    const rawCursor = req.query.cursor;
+
+    // Reject unexpected cursor types and excessively long values.
+    if (
+      typeof rawCursor !== 'string' ||
+      rawCursor.length > 512
+    ) {
+      return res.status(400).json({
+        error: 'Invalid message history cursor.'
+      });
+    }
+
+    // Convert the cursor JSON string into a JavaScript object.
+    try {
+      cursor = JSON.parse(rawCursor);
+    } catch (error) {
+      return res.status(400).json({
+        error: 'Invalid message history cursor.'
+      });
+    }
+  }
+
+  // Retrieve the requested page from PostgreSQL.
+  try {
+    const history = await messageStore.getMessageHistory(
+      limit,
+      cursor
+    );
+
+    // Return the messages and pagination information.
+    return res.json(history);
+  } catch (error) {
+    // Invalid cursors are client errors, not server errors.
+    if (error.message === 'Invalid message history cursor.') {
+      return res.status(400).json({
+        error: error.message
+      });
+    }
+
+    // Record unexpected errors on the server.
+    console.error('Message history retrieval failed:', error.message);
+
+    // Return a generic error without exposing database details.
+    return res.status(500).json({
+      error: 'Could not retrieve message history.'
     });
   }
 });
